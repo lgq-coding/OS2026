@@ -1,0 +1,36 @@
+# Build outputs
+obj/
+bin/
+*.o
+*.d
+*.a
+*.out
+*.asm
+*.sym
+*.img
+
+# Submission and archive files
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Grade/debug temporary files
+.gdb.in
+.qemu.out
+
+# Editor and OS temporary files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local agent/tooling directories
+.agents/
+.codex/
+
+# Local backups
+*.bak
