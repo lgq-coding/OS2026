@@ -474,6 +474,77 @@ RISC-V 硬件加电后最初执行的指令位于 `0x1000`。这些指令完成�
 
 ---
 
+### 4.5 不同环境下的补充验证（刘爽）
+
+刘爽在独立的 WSL2 Ubuntu 24.04 环境中完成了同样的 GDB 验证，但工具链版本较新，遇到了两个与老环境不同的问题，记录如下。
+
+#### 4.5.1 环境版本差异
+
+| 项目 | 小组环境（4.1~4.4节） | 刘爽环境 |
+|------|---------------------|---------|
+| 交叉编译器 | `riscv64-unknown-elf-gcc` 10.2.0 | `riscv64-unknown-elf-gcc` 14.2.0 |
+| 模拟器 | QEMU 5.1.0 | QEMU 10.2.1 |
+| 固件 | OpenSBI v0.7 | OpenSBI v1.8 |
+| 调试器 | GDB 10.1 | GDB 17.1（gdb-multiarch） |
+
+新版本下 OpenSBI 的启动日志格式、PMP 区域数量、SBI 扩展列表都有变化，但启动地址链路 `0x1000 → 0x80000000 → 0x80200000` 与老环境完全一致。
+
+#### 4.5.2 问题一：`qemu-system-misc` 包不含 RISC-V
+
+Ubuntu 24.04 将 QEMU 按架构拆包后，执行 `sudo apt install qemu-system-misc` 虽然装了一堆模拟器，但 `qemu-system-riscv64` 仍然报 `command not found`。原因是 RISC-V 被单独放在 `qemu-system-riscv` 包中。
+
+解决：
+
+```bash
+sudo apt install -y qemu-system-riscv
+sudo ln -sf /usr/bin/gdb-multiarch /usr/bin/riscv64-unknown-elf-gdb
+```
+
+#### 4.5.3 问题二：Makefile 的 `-device loader` 在新 OpenSBI 下不跳转
+
+课程原始 Makefile 使用：
+
+```makefile
+-device loader,file=$(UCOREIMG),addr=0x80200000
+```
+
+在 OpenSBI v1.8 下，启动日志显示：
+
+```text
+Domain0 Next Address : 0x0000000000000000
+```
+
+OpenSBI 准备跳转的目标地址为 0，导致内核完全不执行，只看到 OpenSBI banner。原因是新版 OpenSBI 不识别 QEMU loader 设备直接写入内存的镜像，需要通过标准 `-kernel` 参数告知。
+
+解决：将 Makefile 中 `qemu` 和 `debug` 两个 target 的 loader 行替换为：
+
+```makefile
+-kernel $(UCOREIMG)
+```
+
+修改后 OpenSBI 日志变为：
+
+```text
+Domain0 Next Address : 0x0000000080200000
+Domain0 Next Mode    : S-mode
+```
+
+内核成功执行并输出 `(THU.CST) os is loading ...`。
+
+#### 4.5.4 实测栈指针切换数据
+
+在新环境下用 GDB 单步观测 `kern_entry`，得到与 4.4 节一致的结论，具体数值为：
+
+```text
+刚进入 kern_entry 时：  pc = 0x80200000,  sp = 0x80045e30   （OpenSBI 留下的临时栈）
+单步执行 la sp 后：      pc = 0x80200004, sp = 0x80203000   （已切换到内核栈顶）
+单步执行 tail 后：       pc = 0x8020000a                   （进入 kern_init）
+```
+
+其中 `0x80045e30` 是 OpenSBI v1.8 在 M-mode 下使用的临时栈地址，与老环境不同，但切换前后的语义完全一致：内核接管后第一件事就是把 `sp` 换成自己的 `bootstacktop`。
+
+---
+
 ## 五、测试与验证
 
 ### 5.1 编译验证
@@ -580,3 +651,9 @@ quit
 2. 对地址、寄存器、调用约定等关键内容，要回到源码和调试结果核对；
 3. Prompt 中应写清楚目标地址、观察点和预期结果，便于后续复盘；
 4. AI 生成的解释需要人工判断，尤其是链接器重定位、启动地址和特权级相关概念。
+
+刘爽在独立环境中额外使用豆包（桌面端）辅助，补充经验如下：
+
+5. **环境版本差异要主动核对**：小组环境为 QEMU 5.1/OpenSBI v0.7，刘爽本机为 QEMU 10.2/OpenSBI v1.8，同样的 Makefile 命令行为不同。遇到"只刷 OpenSBI banner 不进内核"时，是通过 GDB 看 `Domain0 Next Address=0` 定位到 loader 方式不被新版固件识别，而非盲目猜代码问题。
+6. **把原始报错完整贴给 AI**：`qemu-system-riscv64: command not found`、`Domain0 Next Address: 0x0` 这类原始输出是定位问题的钥匙，概括成"跑不起来"反而会误导。
+7. **GDB 单步不能省**：助教现场会追问"刚进 kern_entry 时 sp 是多少"，只有自己 `si` 走一遍、亲眼看到 `sp 从 0x80045e30 变成 0x80203000`，才能答上来。
