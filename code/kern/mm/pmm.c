@@ -61,7 +61,65 @@ size_t nr_free_pages(void) {
     return pmm_manager->nr_free_pages();
 }
 
-//lab2 function1 YOUR CODE
+//lab2 function1 2132456759
+static void
+page_init(void) {
+    extern char end[];
+
+    uint64_t mem_base = get_memory_base();
+    uint64_t mem_size = get_memory_size();
+    uint64_t mem_end = mem_base + mem_size;
+
+    if (mem_base < DRAM_BASE || mem_size == 0 || mem_end <= mem_base) {
+        panic("page_init: invalid physical memory range [0x%016lx, 0x%016lx)",
+              mem_base, mem_end);
+    }
+
+    // The kernel is linked at a high virtual address, while the boot page
+    // table maps it with a fixed physical/virtual offset.
+    va_pa_offset = PHYSICAL_MEMORY_OFFSET;
+
+    // Page descriptors cover every physical page in [nbase, npage).
+    npage = PPN(mem_end);
+    if (npage <= nbase) {
+        panic("page_init: no manageable physical memory");
+    }
+
+    // Place the Page descriptor array immediately after the kernel image.
+    pages = (struct Page *)ROUNDUP((uintptr_t)end, PGSIZE);
+    size_t nr_pages = npage - nbase;
+    uintptr_t pages_end_va = (uintptr_t)pages + nr_pages * sizeof(struct Page);
+    uintptr_t pages_end_pa = PADDR(pages_end_va);
+
+    if (pages_end_pa > mem_end) {
+        panic("page_init: Page descriptor array exceeds physical memory");
+    }
+
+    // Initially reserve every descriptor. init_memmap() will clear the
+    // reserved bit for pages that are actually handed to the allocator.
+    for (struct Page *p = pages; p < pages + nr_pages; p++) {
+        p->flags = 0;
+        p->property = 0;
+        set_page_ref(p, 0);
+        SetPageReserved(p);
+    }
+
+    // The kernel, boot page table, and descriptor array are all below this
+    // address. Keep only complete pages between it and the DTB memory end.
+    uintptr_t free_start_pa = ROUNDUP(pages_end_pa, PGSIZE);
+    uintptr_t free_end_pa = ROUNDDOWN(mem_end, PGSIZE);
+
+    cprintf("physical memory map:\n");
+    cprintf("memory: 0x%016lx, [0x%016lx, 0x%016lx].\n",
+            mem_size, mem_base, mem_end - 1);
+
+    if (free_start_pa < free_end_pa) {
+        struct Page *base = pa2page(free_start_pa);
+        size_t free_pages = (free_end_pa - free_start_pa) / PGSIZE;
+        init_memmap(base, free_pages);
+    }
+}
+
 
 /* pmm_init - initialize the physical memory management */
 void pmm_init(void) {
