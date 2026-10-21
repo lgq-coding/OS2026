@@ -175,3 +175,15 @@
 **使用目的：**完成 Best-Fit 连续物理内存分配功能。
 
 **结果：**课程检查输出 `[Test 2] Best-Fit: PASS`，总分为 20/20。
+
+## 刘爽：QEMU MMU 分支任务
+
+### Prompt 17：分析 QEMU 的 RISC-V 地址翻译路径
+
+**内容：**
+
+> 分析 QEMU 5.1 中 RISC-V Sv39 地址翻译的调用路径，说明 TCG TLB 命中与 miss、`riscv_cpu_tlb_fill()`、`get_physical_address()` 的三级页表遍历、PTE 权限检查和 `tlb_set_page()` 的关系，并给出使用宿主机 GDB 观察这些函数的断点脚本。
+
+**使用目的：**完成 GDB 调试 QEMU 页表查询的分支任务，并理解软件模拟 MMU 与真实硬件 TLB 的区别。
+
+**结果：**通过 QEMU monitor 观察到 `0xffffffffc0000000 -> 0x80000000` 的 1 GiB 映射，整理出 QEMU 5.1 的地址翻译调用链和可复现的源码级 GDB 脚本。

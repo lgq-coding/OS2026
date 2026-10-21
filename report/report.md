@@ -54,8 +54,8 @@
 
 | 成员 | AI 编程工具 | 底层模型 | 配置 |
 |------|------------|---------|-------------|
-| 刘国全 | 待确认 | 待确认 | 待确认 |
-| 刘爽 | 待确认 | 待确认 | 待确认 |
+| 刘国全 | Codex（VS Code/终端 Agent） | DeepSeek Flash（`deepseek-flash`） | 推理强度 high |
+| 刘爽 | 豆包（桌面端） | 具体模型版本未记录 | 独立 WSL 环境补充验证 |
 | 王乐妍 | Claude Code | DeepSeek flash | 推理强度 high |
 
 ---
@@ -694,6 +694,130 @@ Total Score: 20/20
 ```
 
 说明 SLUB 自检不会破坏 Best-Fit 的空闲页链表和页面计数。
+
+### 5.5 分支任务：GDB 调试 QEMU 页表查询过程
+
+#### 实际观察
+
+使用现有 QEMU 启动 Lab2 内核，并通过 QEMU monitor 查看 CPU 状态和当前地址映射：
+
+```text
+(qemu) info registers
+pc       ffffffffc0200110
+stvec    0000000080200000
+satp     (由 Sv39 启动页表配置)
+
+(qemu) info mem
+vaddr            paddr            size             attr
+---------------- ---------------- ---------------- -------
+ffffffffc0000000 0000000080000000 0000000040000000 rwx--ad
+```
+
+该结果验证了内核高地址虚拟空间与物理内存的 1 GiB 映射：虚拟地址 `0xffffffffc0000000` 对应物理地址 `0x80000000`，与启动页表 `boot_page_table_sv39` 的最后一个 1 GiB 叶子页表项一致。当前 QEMU 5.1 的 monitor 不支持 `info tlb`，因此页面映射主要由 `info mem` 和 GDB 页表读取验证。
+
+#### QEMU 源码调用路径
+
+根据 QEMU 5.1 的 RISC-V 实现，地址翻译的关键路径为：
+
+```text
+TCG 访存指令
+  -> TLB 快速查找 (accel/tcg/cputlb.c)
+  -> TLB miss
+  -> tlb_fill()
+  -> cc->tlb_fill == riscv_cpu_tlb_fill()
+  -> get_physical_address()
+  -> Sv39 三级页表遍历
+  -> tlb_set_page()
+```
+
+关键函数和文件：
+
+| 阶段 | 文件 | 关键函数/分支 |
+|------|------|----------------|
+| TLB 未命中处理 | `accel/tcg/cputlb.c` | `tlb_fill()`、`probe_access_internal()`、`atomic_mmu_lookup()` |
+| RISC-V MMU 入口 | `target/riscv/cpu_helper.c` | `riscv_cpu_tlb_fill()` |
+| 页表遍历 | `target/riscv/cpu_helper.c` | `get_physical_address()` |
+| 写入软件 TLB | `accel/tcg/cputlb.c` | `tlb_set_page()` |
+
+`get_physical_address()` 的主要分支：
+
+1. 从 `env->satp` 中读取 Sv39 模式位和根页表物理页号；
+2. 根据虚拟地址计算 VPN2、VPN1、VPN0 和页内偏移；
+3. 每一级通过 `address_space_ldq()` 读取 8 字节页表项；
+4. 检查 `PTE_V`；
+5. 若 `R/W/X` 全为 0，则该 PTE 指向下一级页表，继续遍历；
+6. 若 `R/W/X` 非空，则它是叶子 PTE，取其 PPN 并和页内偏移组合成物理地址；
+7. 检查 U、A、D 和读写执行权限；
+8. 翻译成功后调用 `tlb_set_page()` 缓存映射。
+
+#### 源码级 GDB 调试脚本
+
+预编译课程 QEMU 被 strip，不能直接通过函数名设置源码断点。要完整单步 QEMU 源码，需要使用带调试符号的 QEMU 构建：
+
+```bash
+cd /path/to/qemu-5.1.0
+./configure --target-list=riscv64-softmmu --enable-debug --disable-werror
+make -j"$(nproc)"
+```
+
+然后使用宿主机 GDB 调试 QEMU 进程，同时用 RISC-V GDB 或 QEMU monitor 调试 guest：
+
+```gdb
+set pagination off
+set breakpoint pending on
+
+break riscv_cpu_tlb_fill
+commands
+  silent
+  printf "tlb_fill va=%#lx access=%d mmu_idx=%d\n", address, access_type, mmu_idx
+  bt 6
+  continue
+end
+
+break get_physical_address
+commands
+  silent
+  printf "walk va=%#lx satp=%#lx\n", addr, env->satp
+  continue
+end
+
+break tlb_set_page
+commands
+  silent
+  printf "set_page vaddr=%#lx paddr=%#lx\n", vaddr, paddr
+  continue
+end
+```
+
+可以进一步设置条件断点，只观察内核入口 `0x80200000` 对应的翻译：
+
+```gdb
+break get_physical_address if addr == 0xffffffffc0200000
+```
+
+在 QEMU 源码调试窗口中执行到断点后，使用：
+
+```gdb
+p/x *physical
+p/x env->satp
+p/x addr
+bt
+si
+```
+
+观察页表读写、权限检查和物理地址合成。
+
+#### QEMU 软件 TLB 与真实硬件 TLB 的区别
+
+| 方面 | QEMU 软件 TLB | 真实 CPU TLB |
+|------|---------------|--------------|
+| 实现方式 | QEMU 在宿主机内存中维护翻译缓存 | CPU 内部专用高速缓存 |
+| 结构 | 软件数据结构，容量和替换策略由 QEMU 决定 | 固定组相联/全相联结构和硬件替换算法 |
+| 一致性 | 由 `tlb_flush` 和 MMU 失效操作维护 | 由硬件遵循规范维护，可能涉及 ASID、TLB shootdown |
+| 性能模型 | 关注功能正确性，通常不精确模拟访问延迟 | 命中率、延迟和并发行为直接影响性能 |
+| 页表遍历 | `get_physical_address()` 用软件循环模拟 | MMU 硬件自动完成多级页表查询 |
+
+因此，QEMU 可以用来验证地址翻译的**逻辑和页表内容**，但不能用于准确测量真实 CPU 的 TLB 命中率、替换行为和时序性能。
 
 ---
 
