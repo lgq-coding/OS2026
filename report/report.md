@@ -100,6 +100,78 @@ entry.S
 
 #### 4.1.1实现物理内存探测与页描述符初始化功能
 
+**模块目标**
+
+根据设备树报告的物理内存范围，建立覆盖所有可管理物理页的 `struct Page` 描述符数组，并把 OpenSBI、内核镜像、启动页表和描述符数组之外的完整空闲页交给当前 `pmm_manager`。
+
+**核心实现**
+
+`page_init()` 位于 `kern/mm/pmm.c`，主要步骤如下：
+
+1. 调用 `get_memory_base()` 和 `get_memory_size()` 获取 DTB 内存范围，计算 `mem_end`；
+2. 设置 `va_pa_offset = PHYSICAL_MEMORY_OFFSET`；
+3. 计算 `npage = PPN(mem_end)`，描述符覆盖 `[nbase, npage)`；
+4. 将描述符数组起点设为 `ROUNDUP(end, PGSIZE)`；
+5. 将全部描述符初始化为保留状态，防止未完成布局的页面进入空闲链表；
+6. 用 `PADDR()` 求描述符数组的物理结束地址；
+7. 将 `free_start_pa` 向上取整，将 DTB 内存末端向下取整；
+8. 通过 `pa2page(free_start_pa)` 找到空闲区首描述符，调用 `init_memmap()` 注册完整空闲页。
+
+地址转换关系：
+
+```text
+物理地址 = 虚拟地址 - va_pa_offset
+Page 描述符下标 = PPN(pa) - nbase
+```
+
+**Spec**
+
+```text
+Pre-Condition:
+  dtb_init() 已经完成，get_memory_base()/get_memory_size() 返回有效范围；
+  pmm_manager 已初始化，页级分配器尚未接管任何页面。
+
+Post-Condition:
+  va_pa_offset == PHYSICAL_MEMORY_OFFSET；
+  npage == PPN(mem_base + mem_size)；
+  pages 位于 end 之后且按页对齐；
+  OpenSBI、内核、页表和描述符数组对应页面保持保留；
+  剩余完整页已通过 init_memmap() 加入当前分配器。
+
+Failure:
+  DTB 范围无效、npage <= nbase 或描述符数组超出物理内存时调用 panic()；
+  没有完整空闲页时不调用 init_memmap()。
+```
+
+**最终 Prompt**
+
+```text
+[PROMPT]
+在 ucore Lab2 的 kern/mm/pmm.c 中实现 page_init()，建立 Page 描述符数组并把完整空闲
+物理页注册给当前 pmm_manager。
+
+[RELY]
+get_memory_base()/get_memory_size()、DRAM_BASE、PGSIZE、PPN、PADDR、ROUNDUP、
+ROUNDDOWN、struct Page、pages、npage、nbase、va_pa_offset、init_memmap()、pa2page()。
+
+[GUARANTEE]
+static void page_init(void);
+
+[SPECIFICATION]
+区分 VA、PA、PPN 和 Page 描述符地址；描述符覆盖 [nbase, npage)；数组从 ROUNDUP(end,
+PGSIZE) 开始；所有描述符先标记 reserved；排除固件、内核和描述符数组后，只把页对齐的
+完整空闲页交给 init_memmap()；非法 DTB 或无描述符空间时 panic。
+```
+
+**验证结果**
+
+```text
+physical memory map:
+memory: 0x0000000008000000, [0x0000000080000000, 0x0000000087ffffff].
+[Test 1] Page Init: PASS
+check_alloc_page() succeeded!
+```
+
 ---
 
 ### 4.2 物理内存分配功能
@@ -128,6 +200,78 @@ First-Fit 的优点是实现简单，优先利用低地址区域，且地址有�
 
 #### 4.2.2 实现 Best-Fit 连续物理内存分配算法
 
+**核心实现**
+
+`best_fit_pmm.c` 复用与 First-Fit 相同的地址有序空闲页链表，但分配时不再选择第一个可满足块，而是扫描整个链表，选择满足请求且剩余空间最小的块；遇到大小恰好等于请求的块时可以提前结束。
+
+主要函数：
+
+```c
+static free_area_t free_area;
+#define free_list (free_area.free_list)
+#define nr_free   (free_area.nr_free)
+
+static void best_fit_init(void);
+static void best_fit_init_memmap(struct Page *base, size_t n);
+static struct Page *best_fit_alloc_pages(size_t n);
+static void best_fit_free_pages(struct Page *base, size_t n);
+static size_t best_fit_nr_free_pages(void);
+static void best_fit_check(void);
+```
+
+分配过程：
+
+1. 若 `n > nr_free`，直接返回 `NULL`；
+2. 遍历空闲链表，记录 `property >= n` 且 `property` 最小的页块；
+3. 将目标页块从链表移除；
+4. 若页块大于 `n`，把剩余页建立为新的空闲块并插回链表；
+5. 清除分配块头页的 `PageProperty`，更新 `nr_free`。
+
+释放过程与 First-Fit 类似：恢复页块描述符、按地址顺序插入链表，并分别检查左、右相邻块，必要时合并。Best-Fit 通过减少单次分配留下的剩余空间，降低产生小碎片的概率；代价是每次分配通常需要扫描整个空闲链表，时间复杂度为 `O(N)`。
+
+**Spec**
+
+```text
+Pre-Condition:
+  pmm_manager 已切换到 best_fit_pmm_manager；
+  init_memmap() 已把可用连续页加入 free_list。
+
+Post-Condition:
+  alloc_pages(n) 返回满足 n 页请求且剩余空间最小的空闲块；
+  若块大于 n，剩余页仍是有序空闲链表中的一个块；
+  free_pages(base, n) 后页块回到链表，并与左右相邻块正确合并；
+  nr_free_pages() 始终等于所有链表空闲块大小之和。
+```
+
+**最终 Prompt**
+
+```text
+[PROMPT]
+参考 default_pmm.c，在 kern/mm/best_fit_pmm.c 中实现 Best-Fit 管理器，并在 pmm.c 的
+init_pmm_manager() 中切换到 best_fit_pmm_manager。不得修改 basic_check() 和
+best_fit_check()。
+
+[RELY]
+struct pmm_manager、free_area_t、PageProperty、le2page、list_*、nr_free、alloc_pages、
+free_pages。
+
+[GUARANTEE]
+best_fit_init、best_fit_init_memmap、best_fit_alloc_pages、best_fit_free_pages、
+best_fit_nr_free_pages、best_fit_check、best_fit_pmm_manager。
+
+[SPECIFICATION]
+alloc_pages 必须选择满足请求且剩余空间最小的块；相等时保持链表遍历结果；剩余部分必须
+拆分；free_pages 必须合并左右连续空闲块；分配、释放后链表、property、PageProperty 和
+nr_free 必须保持一致。
+```
+
+**验证结果**
+
+```text
+memory management: best_fit_pmm_manager
+[Test 2] Best-Fit: PASS
+Total Score: 20/20
+```
 
 ---
 
@@ -326,6 +470,142 @@ static void buddy_check(void);
 
 ---
 
+### 4.3 选做 Challenge
+
+#### 4.3.1 Challenge：操作系统如何自行获取可用物理内存范围
+
+如果操作系统不能提前假定硬件内存布局，可以采用以下办法获得可用物理内存信息：
+
+1. **使用固化在平台启动协议中的数据**
+   - RISC-V 平台通常由固件把设备树 DTB 地址放在 `a1` 寄存器中。内核解析 DTB 的 `memory` 节点，读取 `reg` 属性中的基地址和大小。
+   - x86 平台可以从 BIOS/UEFI 提供的 E820、UEFI Memory Map 或 ACPI 表中获取可用内存、保留区和 MMIO 空洞。
+   - Multiboot/Multiboot2 等引导协议也会向内核传递内存映射。
+
+2. **从固件服务或平台接口查询**
+   - 通过 UEFI Boot Services 的 `GetMemoryMap()` 获取内存描述符数组。
+   - 通过 SBI、OpenFirmware 或其他平台固件接口查询内存节点和设备树。
+
+3. **读取平台配置或硬件寄存器**
+   - 某些嵌入式平台提供内存大小配置寄存器或芯片 ID，可在启动时读取。
+   - 也可以从只读平台描述、设备树二进制或板级支持包中的静态配置获得。
+
+4. **主动探测内存**
+   - 在保证地址不属于 MMIO、ROM 或保留区的前提下，可以逐页进行“写入后读回”检测。
+   - 这种方法风险较高：错误访问 MMIO 可能产生副作用，访问未映射地址会触发异常，因此通常只作为固件不可用时的后备方案，并需要异常处理保护。
+
+本实验采用 DTB 方案，是因为 QEMU `virt` 平台会把物理内存布局通过设备树报告给内核，安全且不需要猜测硬件地址。
+
+#### 4.3.2 Challenge：SLUB 任意大小对象分配
+
+**实现目标**
+
+在页级分配器之上增加对象级分配层：
+
+```text
+SLUB 对象分配
+  -> 单页 slab 或连续多页
+  -> best_fit_pmm_manager 的 alloc_pages/free_pages
+```
+
+**实现结构**
+
+- 小对象按 `8、16、32、64、128、256、512、1024、2048` 字节分成大小类别；
+- 每个小对象 slab 占用一个物理页；
+- slab 页头保存 cache、Page 指针、空闲链表、对象总数和使用数；
+- 每个对象前放置头部，记录 magic 和所属 slab；
+- 空 slab 会从 cache 中移除并归还物理页；
+- 大于 2048 字节的请求直接分配连续多页，并在页首保存大对象元数据。
+
+公开接口：
+
+```c
+void slub_init(void);
+void *slub_alloc(size_t size);
+void slub_free(void *ptr);
+void slub_check(void);
+```
+
+代码位置：
+
+```text
+code/kern/mm/slub.c
+code/kern/mm/slub.h
+```
+
+**提示词一：生成 SLUB 模块**
+
+```text
+[PROMPT]
+在 ucore Lab2 的 kern/mm 目录下从零实现一个简化 SLUB 对象分配器。它必须建立在现有
+alloc_pages()/free_pages() 页级分配接口之上，不能使用宿主机 malloc/free。新增
+slub.c 和 slub.h，并在 pmm_init() 完成 PMM 初始化后调用 slub_init() 和 slub_check()。
+
+[RELY]
+- struct Page、page2pa()、pa2page()、va_pa_offset、PGSIZE
+- struct pmm_manager 的 alloc_pages/free_pages
+- cprintf/assert 和内核已有的类型定义
+- 不允许修改课程测试和其他 PMM 的状态约定
+
+[GUARANTEE]
+void slub_init(void);
+void *slub_alloc(size_t size);
+void slub_free(void *ptr);
+void slub_check(void);
+
+[SPECIFICATION]
+1. 小对象按 8 到 2048 字节的幂次大小分类，从单页 slab 中分配。
+2. slab 页内保存 metadata 和对象空闲链表；耗尽时申请新页，空 slab 释放回 PMM。
+3. 大于 2048 字节的请求按完整页数分配连续页，释放时恢复整段页面。
+4. 返回对象至少按 16 字节对齐；size 为 0 返回 NULL，分配失败返回 NULL。
+5. slub_free(NULL) 无副作用；重复释放或损坏 magic 由断言阻止。
+6. slub_check() 必须覆盖不同大小、批量分配、对象复用、超页分配和空闲页数量恢复。
+```
+
+**提示词二：生成 SLUB 自检**
+
+```text
+[PROMPT]
+为当前 slub.c 设计并实现 slub_check()，只修改 slub.c，不修改其他文件。测试必须直接调用
+slub_alloc()/slub_free()，并在结束时验证 nr_free_pages() 回到测试前基线。
+
+[RELY]
+- slub_alloc(size_t)、slub_free(void *)、nr_free_pages()
+- 内核 assert 和 cprintf
+
+[GUARANTEE]
+void slub_check(void);
+
+[SPECIFICATION]
+至少覆盖：
+1. size=0 返回 NULL；
+2. 连续申请 96 个 64 字节对象，跨越多个 slab；
+3. 地址非空、互不重复且按 16 字节对齐；
+4. 全部释放后空闲页数恢复；
+5. 100 字节对象写入并读回，检查数据完整性；
+6. 2048 字节边界对象；
+7. 5000 字节多页对象及首尾数据；
+8. 释放后的对象可以被再次分配；
+9. 所有测试结束时空闲页计数与起始基线一致；
+10. 失败立即通过 assert 暴露，成功输出 [SLUB] self-check: PASS。
+```
+
+**测试覆盖说明**
+
+自检覆盖了：
+
+- 零大小请求；
+- 小对象跨 slab 批量分配；
+- 地址唯一性和 16 字节对齐；
+- 对象内容完整性；
+- 小对象大小上限 2048 字节；
+- 大于一页的连续多页对象；
+- 对象释放与重新分配；
+- 所有分配释放后物理页计数恢复。
+
+因此，它既检查了对象层的数据正确性，也检查了 SLUB 是否会把页面泄漏在已分配状态。
+
+---
+
 ## 五、测试与验证
 
 ### 5.1 编译与 QEMU 启动
@@ -385,6 +665,35 @@ Total Score: 20/20
 ![Buddy System 自检输出](./images/04_buddy_check.png)
 
 该测试只用于独立验证 Buddy 模块，截图完成后恢复 Best-Fit 配置，不影响 5.2 节的课程检查结果。
+
+### 5.4 SLUB Challenge 自检
+
+在 Best-Fit 作为当前 PMM 的情况下，`pmm_init()` 完成课程检查后调用：
+
+```c
+slub_init();
+slub_check();
+```
+
+QEMU 实际输出：
+
+```text
+memory management: best_fit_pmm_manager
+physical memory map:
+memory: 0x0000000008000000, [0x0000000080000000, 0x0000000087ffffff].
+check_alloc_page() succeeded!
+[SLUB] self-check: PASS
+```
+
+随后再次执行 `make grade`，原有课程测试仍为：
+
+```text
+-check page init:  OK
+-check best fit:   OK
+Total Score: 20/20
+```
+
+说明 SLUB 自检不会破坏 Best-Fit 的空闲页链表和页面计数。
 
 ---
 
