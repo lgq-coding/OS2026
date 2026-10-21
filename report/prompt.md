@@ -186,4 +186,4 @@
 
 **使用目的：**完成 GDB 调试 QEMU 页表查询的分支任务，并理解软件模拟 MMU 与真实硬件 TLB 的区别。
 
-**结果：**通过 QEMU monitor 观察到 `0xffffffffc0000000 -> 0x80000000` 的 1 GiB 映射，整理出 QEMU 5.1 的地址翻译调用链和可复现的源码级 GDB 脚本。
+**结果：**实际构建 QEMU 4.1.1 调试版，并用宿主机 GDB 命中 `riscv_cpu_tlb_fill`、`get_physical_address` 和 `tlb_set_page`；观察到 `0xffffffffc02000d8 -> 0x80200000`，`satp=0x8000000000080205`，验证了 Sv39 页表遍历和软件 TLB 安装过程。

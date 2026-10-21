@@ -697,115 +697,168 @@ Total Score: 20/20
 
 ### 5.5 分支任务：GDB 调试 QEMU 页表查询过程
 
-#### 实际观察
+#### 调试环境
 
-使用现有 QEMU 启动 Lab2 内核，并通过 QEMU monitor 查看 CPU 状态和当前地址映射：
+- QEMU：源码编译的 4.1.1 调试版；
+- 配置：`--target-list=riscv32-softmmu,riscv64-softmmu --enable-debug --disable-werror`；
+- 生成的 `riscv64-softmmu/qemu-system-riscv64` 包含完整的调试符号；
+- 宿主机 GDB：GNU GDB 15.1；
+- guest：Lab2 的 `bin/ucore.img`，加载到 `0x80200000`；
+- 宿主机 GDB 只在 guest 访问高地址内核空间时命中，从而避免被 `0x1000` 处的 MROM 访问干扰。
+
+#### 实际 GDB 观察结果
+
+第一次命中 TLB miss：
 
 ```text
-(qemu) info registers
-pc       ffffffffc0200110
-stvec    0000000080200000
-satp     (由 Sv39 启动页表配置)
-
-(qemu) info mem
-vaddr            paddr            size             attr
----------------- ---------------- ---------------- -------
-ffffffffc0000000 0000000080000000 0000000040000000 rwx--ad
+HOST GDB: TLB FILL address=0xffffffffc02000d8 access=2 mmu_idx=1
+satp = 0x8000000000080205
+priv = 1
 ```
 
-该结果验证了内核高地址虚拟空间与物理内存的 1 GiB 映射：虚拟地址 `0xffffffffc0000000` 对应物理地址 `0x80000000`，与启动页表 `boot_page_table_sv39` 的最后一个 1 GiB 叶子页表项一致。当前 QEMU 5.1 的 monitor 不支持 `info tlb`，因此页面映射主要由 `info mem` 和 GDB 页表读取验证。
+调用栈：
+
+```text
+#0 riscv_cpu_tlb_fill
+#1 tlb_fill
+#2 get_page_addr_code
+#3 tb_htable_lookup
+#4 tb_lookup__cpu_state
+#5 helper_lookup_tb_ptr
+```
+
+随后进入 QEMU 的软件页表遍历：
+
+```text
+HOST GDB: PAGE WALK addr=0xffffffffc02000d8
+satp = 0x8000000000080205
+```
+
+`get_physical_address()` 返回后：
+
+```text
+address = 0xffffffffc02000d8
+pa      = 0x80200000
+prot    = 0x7
+ret     = 0
+```
+
+最后在 `tlb_set_page()` 观察到：
+
+```text
+vaddr = 0xffffffffc0200000
+paddr = 0x80200000
+prot  = 0x7
+size  = 0x1000
+```
+
+因此，guest 的高地址指令取指地址：
+
+```text
+0xffffffffc02000d8
+```
+
+被 QEMU 翻译为：
+
+```text
+0x80200000
+```
+
+其中页内偏移为 `0xd8`，虚拟页基址为 `0xffffffffc0200000`，物理页基址为 `0x80200000`。
+
+#### satp 与 Sv39 页表解析
+
+观察到的 satp：
+
+```text
+0x8000000000080205
+```
+
+其字段含义：
+
+```text
+MODE = 8              -> Sv39
+PPN  = 0x80205
+根页表物理地址 = 0x80205 << 12 = 0x80205000
+```
+
+对虚拟地址 `0xffffffffc02000d8`：
+
+```text
+VPN2  = 0x1ff
+VPN1  = 0x001
+VPN0  = 0x000
+Offset = 0xd8
+```
+
+QEMU 从根页表地址 `0x80205000` 开始，结合 `VPN2/VPN1/VPN0` 完成三级页表查询，得到物理页基址 `0x80200000`，再加上页内偏移 `0xd8`，得到目标物理地址 `0x802000d8`。`tlb_set_page()` 缓存的是页级映射：
+
+```text
+0xffffffffc0200000 -> 0x80200000
+```
+
+这与启动代码中最后一个 1 GiB 的 Sv39 叶子页表项一致。
 
 #### QEMU 源码调用路径
 
-根据 QEMU 5.1 的 RISC-V 实现，地址翻译的关键路径为：
-
 ```text
-TCG 访存指令
-  -> TLB 快速查找 (accel/tcg/cputlb.c)
-  -> TLB miss
+guest TCG 取指
+  -> get_page_addr_code()
   -> tlb_fill()
-  -> cc->tlb_fill == riscv_cpu_tlb_fill()
+  -> riscv_cpu_tlb_fill()
   -> get_physical_address()
-  -> Sv39 三级页表遍历
+  -> 三级 Sv39 页表遍历
   -> tlb_set_page()
+  -> 后续访问从 QEMU 软件 TLB 命中
 ```
 
-关键函数和文件：
+关键文件和函数：
 
 | 阶段 | 文件 | 关键函数/分支 |
 |------|------|----------------|
-| TLB 未命中处理 | `accel/tcg/cputlb.c` | `tlb_fill()`、`probe_access_internal()`、`atomic_mmu_lookup()` |
-| RISC-V MMU 入口 | `target/riscv/cpu_helper.c` | `riscv_cpu_tlb_fill()` |
-| 页表遍历 | `target/riscv/cpu_helper.c` | `get_physical_address()` |
-| 写入软件 TLB | `accel/tcg/cputlb.c` | `tlb_set_page()` |
+| TCG 取指和地址翻译 | `accel/tcg/cputlb.c` | `get_page_addr_code()`、`tlb_fill()` |
+| RISC-V TLB miss | `target/riscv/cpu_helper.c` | `riscv_cpu_tlb_fill()` |
+| Sv39 页表遍历 | `target/riscv/cpu_helper.c` | `get_physical_address()` |
+| 软件 TLB 安装 | `accel/tcg/cputlb.c` | `tlb_set_page()` |
 
-`get_physical_address()` 的主要分支：
+`get_physical_address()` 的关键流程：
 
-1. 从 `env->satp` 中读取 Sv39 模式位和根页表物理页号；
-2. 根据虚拟地址计算 VPN2、VPN1、VPN0 和页内偏移；
-3. 每一级通过 `address_space_ldq()` 读取 8 字节页表项；
+1. 从 `env->satp` 读取 MODE 和根页表 PPN；
+2. 根据虚拟地址计算 VPN2、VPN1、VPN0 和 Offset；
+3. 每一级页表项通过 `address_space_ldq()` 读取；
 4. 检查 `PTE_V`；
-5. 若 `R/W/X` 全为 0，则该 PTE 指向下一级页表，继续遍历；
-6. 若 `R/W/X` 非空，则它是叶子 PTE，取其 PPN 并和页内偏移组合成物理地址；
-7. 检查 U、A、D 和读写执行权限；
-8. 翻译成功后调用 `tlb_set_page()` 缓存映射。
+5. 若 R/W/X 全为 0，则该 PTE 指向下一级页表；
+6. 若 R/W/X 非空，则该 PTE 是叶子项，组合 PPN 与页内偏移得到物理地址；
+7. 检查 U、A、D 和访问权限；
+8. 翻译成功后通过 `tlb_set_page()` 安装软件 TLB 项。
 
-#### 源码级 GDB 调试脚本
-
-预编译课程 QEMU 被 strip，不能直接通过函数名设置源码断点。要完整单步 QEMU 源码，需要使用带调试符号的 QEMU 构建：
-
-```bash
-cd /path/to/qemu-5.1.0
-./configure --target-list=riscv64-softmmu --enable-debug --disable-werror
-make -j"$(nproc)"
-```
-
-然后使用宿主机 GDB 调试 QEMU 进程，同时用 RISC-V GDB 或 QEMU monitor 调试 guest：
+#### 调试用 GDB 脚本核心命令
 
 ```gdb
 set pagination off
+set confirm off
 set breakpoint pending on
 
-break riscv_cpu_tlb_fill
-commands
-  silent
-  printf "tlb_fill va=%#lx access=%d mmu_idx=%d\n", address, access_type, mmu_idx
-  bt 6
-  continue
-end
-
-break get_physical_address
-commands
-  silent
-  printf "walk va=%#lx satp=%#lx\n", addr, env->satp
-  continue
-end
-
-break tlb_set_page
-commands
-  silent
-  printf "set_page vaddr=%#lx paddr=%#lx\n", vaddr, paddr
-  continue
-end
-```
-
-可以进一步设置条件断点，只观察内核入口 `0x80200000` 对应的翻译：
-
-```gdb
-break get_physical_address if addr == 0xffffffffc0200000
-```
-
-在 QEMU 源码调试窗口中执行到断点后，使用：
-
-```gdb
-p/x *physical
+break riscv_cpu_tlb_fill if address >= 0xffffffffc0000000
+run
+bt 8
+p/x address
 p/x env->satp
-p/x addr
-bt
-si
-```
 
-观察页表读写、权限检查和物理地址合成。
+break /tmp/qemu-4.1.1/target/riscv/cpu_helper.c:452 \
+      if address >= 0xffffffffc0000000
+continue
+p/x address
+p/x pa
+p/x prot
+p/x ret
+
+break tlb_set_page if vaddr >= 0xffffffffc0000000
+continue
+p/x vaddr
+p/x paddr
+p/x prot
+```
 
 #### QEMU 软件 TLB 与真实硬件 TLB 的区别
 
