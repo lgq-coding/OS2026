@@ -6,7 +6,7 @@
 |------|------|
 | **实验名称** | Lab2：物理内存和页表 |
 | **小组成员** | 2411822-刘国全、2411350-刘爽、2413423-王乐妍 |
-| **完成日期** | 2026-10-21 |
+| **完成日期** | 2026-10-25 |
 
 ### 小组分工
 
@@ -195,6 +195,43 @@ static size_t default_nr_free_pages(void);
 First-Fit 的优点是实现简单，优先利用低地址区域，且地址有序链表便于合并。它的局限是需要线性扫描链表，并且可能不断切分较大的空闲块，留下大量较小碎片。
 
 优化思路可以为：维护按大小分组的空闲链表、从最小可满足大小开始查找，或者增加大小索引以避免无效扫描；也可以采用 Best-Fit 选择剩余空间最小的页块来降低单次分配产生的碎片。
+
+**Spec**
+
+```text
+Pre-Condition:
+  init_memmap() 已把一段连续可用页按物理地址顺序加入 free_list；
+  每个空闲块头页设置 PageProperty，property 表示连续页数。
+
+Post-Condition:
+  alloc_pages(n) 从链表头开始，返回第一个 property >= n 的页块；
+  若 property > n，剩余页成为新的空闲块并保持地址有序；
+  free_pages(base, n) 将页块插回地址有序链表；
+  左右相邻块满足地址连续时合并，并更新 property、PageProperty 和 nr_free。
+
+Failure:
+  n == 0 时由实现断言阻止；n 超过空闲页数时返回 NULL；
+  非法或重复释放页块时由断言阻止。
+```
+
+**Prompt**
+
+```text
+[PROMPT]
+阅读 default_pmm.c 并分析 First-Fit，说明它如何初始化空闲页、分配连续页、释放页面、
+合并相邻块，并分析该算法是否有进一步改进空间。
+
+[RELY]
+default_init、default_init_memmap、default_alloc_pages、default_free_pages、
+default_nr_free_pages、free_area_t、PageProperty、le2page、nr_free、list_*。
+
+[GUARANTEE]
+不修改代码；在报告中给出各函数职责、分配/释放/合并流程、复杂度和改进方向。
+
+[SPECIFICATION]
+说明地址有序空闲链表、首个满足请求块的选择、剩余块拆分、左右相邻块合并和 O(N) 扫描；
+优化方向至少包含按大小分桶、大小索引或 Best-Fit 等可行方案。
+```
 
 ---
 
@@ -893,7 +930,7 @@ p/x prot
 - 进程与线程调度
 - 进程地址空间隔离
 - 按需分页与页面置换
-- 写时复制 
+- 写时复制
 - 同步与死锁
 - SMP 下的并发分配和 TLB shootdown
 - 文件系统和设备驱动
