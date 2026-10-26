@@ -30,7 +30,7 @@
 | P09 | 王乐妍 | Buddy | 理解 Buddy 与 `pmm_manager` 关系 | 接口确认 |
 | P10 | 王乐妍 | Buddy | 从零实现 Buddy System | 自检通过 |
 | P11 | 王乐妍 | Buddy | 设计 Buddy 自检 | 自检通过 |
-| P12 | 刘爽 | QEMU MMU | 调试 QEMU 页表翻译路径 | 源码级 GDB 验证完成 |
+| P12 | 刘国全 | QEMU MMU | 调试 QEMU 页表翻译路径 | 源码级 GDB 验证完成 |
 | P13 | 刘国全 | SLUB | 实现页级分配之上的对象分配 | `[SLUB] PASS` |
 | P14 | 刘国全 | SLUB | 设计对象分配测试 | 回归 20/20 |
 | P15 | 全员 | 报告 | 汇总 Spec、Prompt、Bug 和结论 | 报告完成 |
@@ -443,7 +443,7 @@ void buddy_check(void);
 
 ### P12：调试 QEMU 页表翻译
 
-**负责人：**刘爽
+**负责人：**刘国全
 
 ```text
 [PROMPT]
