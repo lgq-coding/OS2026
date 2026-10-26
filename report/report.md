@@ -6,7 +6,7 @@
 |------|------|
 | **实验名称** | Lab2：物理内存和页表 |
 | **小组成员** | 2411822-刘国全、2411350-刘爽、2413423-王乐妍 |
-| **完成日期** | 2026-10-25 |
+| **完成日期** | 2026-10-26 |
 
 ### 小组分工
 
@@ -336,6 +336,26 @@ Buddy System 将空闲内存划分为页数始终为 `2^k` 的块，并要求 or
 
 Buddy 模块已经按 `struct pmm_manager` 接口与 PMM 框架对接，Buddy System 通过切换管理器和调用其自检函数完成独立验证，具体过程见 5.3 节。
 
+##### Spec
+
+```text
+Pre-Condition:
+  pmm_manager 已切换为 buddy_pmm_manager；
+  page_init() 已通过 init_memmap() 提交一段连续空闲页。
+
+Post-Condition:
+  1. order k 的块大小为 2^k 页，且首地址按 2^k 页对齐；
+  2. alloc_pages(n) 将 n 向上取整到 2 的幂，并从对应或更高 order 找块；
+  3. 高 order 块逐层拆分，低半块继续使用，高半块放回对应 order；
+  4. free_pages(base, n) 释放完整分配块并逐级合并伙伴；
+  5. nr_free_pages() 等于所有 order 空闲链表的页数总和；
+  6. 自检结束后状态恢复到测试前基线。
+
+Failure:
+  n == 0、n 超过空闲页或没有合适 order 时返回 NULL；
+  非法释放、块不对齐、伙伴状态不一致或重复释放由断言阻止。
+```
+
 ##### 提示词
 
 ###### 提示词一：实现 Buddy System
@@ -571,6 +591,26 @@ code/kern/mm/slub.c
 code/kern/mm/slub.h
 ```
 
+**Spec**
+
+```text
+Pre-Condition:
+  Best-Fit PMM 已完成初始化，alloc_pages/free_pages 可用；
+  slub 尚未持有任何 slab 或大对象页面。
+
+Post-Condition:
+  1. size 为 0 返回 NULL；
+  2. 8~2048 字节对象从对应大小类别的单页 slab 分配；
+  3. 返回地址按 16 字节对齐，不同活动对象互不重叠；
+  4. 空 slab 从 cache 移除并归还物理页；
+  5. 大于 2048 字节的请求分配连续多页，释放时整段归还；
+  6. slub_free(NULL) 无副作用，非法 magic 或重复释放由断言阻止；
+  7. 所有测试释放后 nr_free_pages() 恢复到测试前基线。
+
+Failure:
+  请求大小为 0、页不足或大小计算溢出时返回 NULL。
+```
+
 **提示词一：生成 SLUB 模块**
 
 ```text
@@ -642,6 +682,30 @@ void slub_check(void);
 - 所有分配释放后物理页计数恢复。
 
 因此，它既检查了对象层的数据正确性，也检查了 SLUB 是否会把页面泄漏在已分配状态。
+
+---
+
+### 4.4 AI 生成代码中的 Bug 与解决过程
+
+以下是使用 Prompt 生成和迭代代码时实际发现并修正的主要问题。
+
+| 模块 | 初始问题 | 原因 | 修复方式 |
+|------|----------|------|----------|
+| `page_init()` | Page 描述符数组未统一按页对齐 | 直接把 `end` 作为数组起点，可能与页边界不一致 | 改为 `pages = ROUNDUP(end, PGSIZE)`，并用 `PADDR(pages_end)` 计算空闲区起点 |
+| `page_init()` | 空闲区尾部可能包含不完整页 | 直接使用 DTB 的 `mem_end` | 空闲区尾部改为 `ROUNDDOWN(mem_end, PGSIZE)` |
+| `page_init()` | 描述符未初始化就交给 PMM | `init_memmap()` 要求输入页处于 `PageReserved` 状态 | 先遍历整个描述符数组设置 `reserved`，再由 `init_memmap()` 接管空闲页 |
+| Best-Fit | 初次实现缺少测试所需的 `free_area/free_list/nr_free` | 只按算法思路实现，没有对齐课程测试的状态约定 | 补齐 `free_area_t` 和对应宏，保留 `basic_check/best_fit_check` 不变 |
+| Best-Fit | 只选择首个可满足块不是最优 | 沿用 First-Fit 的提前停止逻辑 | 全表扫描并维护最小可满足 `property`，精确匹配时才提前结束 |
+| Buddy | 未对齐的初始空闲区无法直接拆成合法块 | 只按从 base 开始的 2 的幂块处理 | 按当前地址最大合法对齐 order 逐块切分 |
+| Buddy | 非 2 的幂请求释放时无法恢复完整块 | 释放逻辑只使用调用者传入的页数 | 在分配块头保存实际 2 的幂块大小，释放时按块头恢复 |
+| Buddy | 自检没有验证非伙伴块不可合并 | 只测试了可合并情况 | 增加相邻非伙伴单页块用例，验证“页数够但 order 不匹配时分配失败” |
+| SLUB | 大对象释放无法确定原始页数 | 小对象头和大对象头没有区分 | 大对象在页首保存 magic、pages 和 payload offset |
+| SLUB | 空 slab 可能泄漏物理页 | 只回收了空闲对象，没有从 cache 移除空 slab | slab 使用计数归零时从 cache 链表移除并调用 `free_pages` |
+| QEMU GDB | 首次多行 GDB `commands` 直接通过多个 `-ex` 输入失败 | `silent` 被当作顶层命令 | 改为保存 `.gdb` 命令文件后通过 `-x` 执行 |
+| QEMU GDB | 无条件断点先命中 `0x1000` | 早期 MROM 访问也经过翻译路径 | 增加 `address >= 0xffffffffc0000000` 条件 |
+| QEMU GDB | `-device loader,file:` 启动失败 | 参数中误用了冒号 | 改为 `-device loader,file=...,addr=...` |
+
+这些修正均以课程测试、自检断言或 QEMU 实测输出为依据，而不是仅凭 AI 的解释判断正确性。
 
 ---
 
