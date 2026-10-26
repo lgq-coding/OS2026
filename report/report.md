@@ -722,6 +722,8 @@ check_alloc_page() succeeded!
 [SLUB] self-check: PASS
 ```
 
+![SLUB Challenge 自检](./images/05_slub_check.png)
+
 随后再次执行 `make grade`，原有课程测试仍为：
 
 ```text
@@ -729,6 +731,8 @@ check_alloc_page() succeeded!
 -check best fit:   OK
 Total Score: 20/20
 ```
+
+![加入 SLUB 后的最终课程检查](./images/06_make_grade_final.png)
 
 说明 SLUB 自检不会破坏 Best-Fit 的空闲页链表和页面计数。
 
@@ -744,6 +748,20 @@ Total Score: 20/20
 - 宿主机 GDB 只在 guest 访问高地址内核空间时命中，从而避免被 `0x1000` 处的 MROM 访问干扰。
 
 #### 实际 GDB 观察结果
+
+终端 1 使用 `make debug` 启动暂停的 QEMU，终端 2 使用宿主机 GDB 附加 QEMU 进程：
+
+![make debug 启动 QEMU](./images/07_make_debug.png)
+
+![宿主机 GDB attach QEMU](./images/08_host_gdb_attach.png)
+
+设置 `riscv_cpu_tlb_fill`、`get_physical_address` 返回点和 `tlb_set_page` 断点：
+
+![宿主机 GDB 设置断点](./images/09_host_gdb_breakpoints.png)
+
+第一次命中高地址内核访问的 TLB miss：
+
+![riscv_cpu_tlb_fill 命中](./images/10_riscv_tlb_fill_hit.png)
 
 第一次命中 TLB miss：
 
