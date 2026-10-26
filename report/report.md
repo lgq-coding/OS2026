@@ -736,7 +736,7 @@ Total Score: 20/20
 
 #### 调试环境
 
-- QEMU：源码编译的 4.1.1 调试版；
+- QEMU：源码编译的 4.1.1 调试版，持久化路径为 `~/riscv/qemu-4.1.1-debug`；
 - 配置：`--target-list=riscv32-softmmu,riscv64-softmmu --enable-debug --disable-werror`；
 - 生成的 `riscv64-softmmu/qemu-system-riscv64` 包含完整的调试符号；
 - 宿主机 GDB：GNU GDB 15.1；
@@ -882,7 +882,7 @@ bt 8
 p/x address
 p/x env->satp
 
-break /tmp/qemu-4.1.1/target/riscv/cpu_helper.c:452 \
+break $HOME/riscv/qemu-4.1.1-debug/target/riscv/cpu_helper.c:452 \
       if address >= 0xffffffffc0000000
 continue
 p/x address

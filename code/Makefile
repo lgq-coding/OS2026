@@ -10,7 +10,7 @@ GCCPREFIX := riscv64-unknown-elf-
 #endif
 
 ifndef QEMU
-QEMU := qemu-system-riscv64
+QEMU := $(HOME)/riscv/bin/qemu-system-riscv64-4.1.1-debug
 endif
 
 ifndef SPIKE
