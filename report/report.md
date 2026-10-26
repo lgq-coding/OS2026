@@ -889,6 +889,167 @@ guest TCG 取指
 7. 检查 U、A、D 和访问权限；
 8. 翻译成功后通过 `tlb_set_page()` 安装软件 TLB 项。
 
+#### 关键分支语句与代码位置
+
+QEMU 4.1.1 的 RISC-V 地址翻译主要位于 `target/riscv/cpu_helper.c`，TCG 的 TLB 路径位于 `accel/tcg/cputlb.c`。
+
+| 代码位置 | 关键分支 | 含义 |
+|----------|----------|------|
+| `cpu_helper.c:165-169` | `mode == PRV_M` 且 `MSTATUS_MPRV` | 数据访问可临时使用 MPP 指定的特权级 |
+| `cpu_helper.c:171-175` | `mode == PRV_M || !RISCV_FEATURE_MMU` | M 模式或无 MMU 时，直接把虚拟地址当作物理地址 |
+| `cpu_helper.c:183-202` | `switch (vm)` | 根据 `satp.MODE` 选择 Sv32/Sv39/Sv48/Sv57；Sv39 设置 `levels=3, ptidxbits=9, ptesize=8` |
+| `cpu_helper.c:196-199` | `case VM_1_10_MBARE` | Bare 模式直接返回原地址，不遍历页表 |
+| `cpu_helper.c:223-229` | `masked_msbs != 0 && masked_msbs != mask` | 检查高虚拟地址是否满足符号扩展规则，不合法则失败 |
+| `cpu_helper.c:237-254` | `for (i = 0; i < levels; i++)` | 三级页表遍历循环；每轮读取一个 8 字节 PTE |
+| `cpu_helper.c:256-288` | `PTE_V`、`R/W/X`、`U`、`PPN` 对齐和访问权限分支 | 判断无效 PTE、中间页表项、非法权限和读写执行权限 |
+| `cpu_helper.c:289-334` | A/D 位更新、`*physical = ...` | 必要时更新 Accessed/Dirty，并组合物理页号和页内偏移 |
+| `cpu_helper.c:435-480` | `riscv_cpu_tlb_fill()` | 调用页表遍历；成功后调用 `tlb_set_page()`；失败则抛异常或返回 probe 失败 |
+| `cputlb.c:868-879` | `tlb_fill()` | 调用 CPU 类的 `tlb_fill` 回调，RISC-V 对应 `riscv_cpu_tlb_fill()` |
+| `cputlb.c:1023-1037` | `get_page_addr_code()` | 先查 TLB；只有 `tlb_hit()` 失败时才调用 `tlb_fill()` |
+| `cputlb.c:843-848` | `tlb_set_page()` | 将成功翻译的页级 vaddr/paddr/prot 加入软件 TLB |
+
+#### Sv39 页表遍历到底有几个循环？
+
+源码中只有一个显式的 `for` 循环：
+
+```c
+for (i = 0; i < levels; i++, ptshift -= ptidxbits) {
+    target_ulong idx = (addr >> (PGSHIFT + ptshift)) & ((1 << ptidxbits) - 1);
+    target_ulong pte_addr = base + idx * ptesize;
+    target_ulong pte = ldq_phys(cs->as, pte_addr);
+    ...
+}
+```
+
+Sv39 的 `levels = 3`，所以这个循环执行三次，不是三个嵌套循环。
+
+三次迭代分别对应：
+
+| 迭代 | `ptshift` | 提取的索引 | 页表层级 | PTE 地址 |
+|------|-----------|------------|----------|----------|
+| 1 | 18 | VPN2 | 根页表 | `root + VPN2 * 8` |
+| 2 | 9 | VPN1 | 中间页表 | `next_base + VPN1 * 8` |
+| 3 | 0 | VPN0 | 末级页表 | `next_base + VPN0 * 8` |
+
+每一次迭代执行：
+
+1. `idx = (addr >> (12 + ptshift)) & 0x1ff`；
+2. `pte_addr = base + idx * 8`；
+3. `pte = ldq_phys(pte_addr)` 读取页表项；
+4. 检查 `PTE_V`；
+5. 如果 R/W/X 全为 0，说明它是下一级页表指针：
+   ```c
+   base = (pte >> PTE_PPN_SHIFT) << PGSHIFT;
+   ```
+   然后进入下一轮；
+6. 如果 R/W/X 非空，说明它是叶子 PTE，停止遍历并计算物理地址。
+
+对本次实测地址 `0xffffffffc02000d8`：
+
+```text
+VPN2 = 0x1ff
+VPN1 = 0x001
+VPN0 = 0x000
+offset = 0xd8
+```
+
+最终页基址为 `0x80200000`，加上页内偏移得到 `0x802000d8`。
+
+#### TLB 命中和 miss 的代码路径
+
+取指路径在 `get_page_addr_code()`：
+
+```c
+uintptr_t index = tlb_index(env, mmu_idx, addr);
+CPUTLBEntry *entry = tlb_entry(env, mmu_idx, addr);
+if (unlikely(!tlb_hit(entry->addr_code, addr))) {
+    if (!VICTIM_TLB_HIT(addr_code, addr)) {
+        tlb_fill(env_cpu(env), addr, 0, MMU_INST_FETCH, mmu_idx, 0);
+        index = tlb_index(env, mmu_idx, addr);
+        entry = tlb_entry(env, mmu_idx, addr);
+    }
+    assert(tlb_hit(entry->addr_code, addr));
+}
+```
+
+因此 QEMU 的逻辑确实是：
+
+```text
+先查 TLB
+  -> 命中：直接使用已缓存的页面翻译
+  -> 未命中：tlb_fill -> riscv_cpu_tlb_fill -> get_physical_address
+  -> 页表遍历成功
+  -> tlb_set_page 安装新的 TLB 项
+```
+
+本次宿主机 GDB 的调用栈正好停在 TLB miss 路径：
+
+```text
+get_page_addr_code
+  -> tlb_fill
+  -> riscv_cpu_tlb_fill
+  -> get_physical_address
+```
+
+#### 开启和未开启分页的实际对比
+
+**未开启分页/Bare 或 M 模式路径：**
+
+```text
+address = 0x1000
+satp    = 0
+pa      = 0x1000
+prot    = 0x7
+ret     = 0
+```
+
+在 `get_physical_address()` 的 `mode == PRV_M || !RISCV_FEATURE_MMU` 分支中，直接执行：
+
+```c
+*physical = addr;
+*prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
+return TRANSLATE_SUCCESS;
+```
+
+没有读取页表，虚拟地址和物理地址相同。
+
+**开启 Sv39 后的内核路径：**
+
+```text
+address = 0xffffffffc02000d8
+satp    = 0x8000000000080205
+pa      = 0x80200000
+prot    = 0x7
+```
+
+此时会执行三次页表遍历，并把：
+
+```text
+0xffffffffc0200000 -> 0x80200000
+```
+
+安装到软件 TLB。两者的关键差别是：Bare 路径直接返回原地址，Sv39 路径必须读取 PTE、检查权限并计算物理页号。
+
+#### 有趣的调试细节
+
+1. 预编译课程 QEMU 被 strip，函数名和源码行不可见，必须先构建带调试符号的 QEMU。
+2. 第一次用宿主机 GDB attach 时，程序停在 `_GI_ppoll`，这是 QEMU 的事件循环，不是地址翻译；需要在 `riscv_cpu_tlb_fill` 等函数上设置断点。
+3. 第一次无条件在 `get_physical_address` 下断点会先命中 `0x1000`，因此增加了高地址条件：
+   ```gdb
+   if addr >= 0xffffffffc0000000
+   ```
+4. `riscv_cpu_tlb_fill` 收到的 `address` 包含页内偏移 `0xd8`，而 `tlb_set_page` 缓存的是页基址 `0xffffffffc0200000`。这说明 TLB 的翻译粒度是页。
+5. 使用最新 `keycodemapdb` 构建 QEMU 4.1.1 时出现生成代码不兼容，切换到 QEMU 4.1.1 对应的子模块提交后解决。
+6. host GDB attach 时会提示找不到 `ppoll.c` 的 host 调试源码，这是宿主 libc 源码缺失的警告，不影响 guest 页表调试。
+
+#### AI 辅助调试过程
+
+1. 先让 AI 根据 QEMU 4.1.1 源码定位 RISC-V MMU 相关函数，得到 `riscv_cpu_tlb_fill`、`get_physical_address`、`tlb_fill` 和 `tlb_set_page` 的调用链。
+2. 让 AI 解释 `for (i = 0; i < levels; i++)` 的 `ptshift`、VPN 提取和 PTE 地址计算，确认 Sv39 是一个循环执行三次，而不是三个嵌套循环。
+3. 第一次 GDB 脚本用多个 `-ex commands` 输入失败，AI 建议改为 `.gdb` 命令文件。
+4. 第一次断点命中低位 `0x1000`，AI 建议加上 `address >= 0xffffffffc0000000` 条件，最终命中内核高地址访问。
+5. 在报告中保留 Prompt、错误现象和修复过程，使调试结果可复现，而不是只记录最终成功数据。
+
 #### 调试用 GDB 脚本核心命令
 
 ```gdb

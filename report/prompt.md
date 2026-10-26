@@ -479,11 +479,16 @@ Pre-Condition：
 QEMU 使用 --enable-debug 构建，guest 加载到 0x80200000。
 
 Post-Condition：
-观察到一次虚拟地址 0xffffffffc02000d8 的 TLB miss，并确认其页级映射
-0xffffffffc0200000 -> 0x80200000。
+1. 观察到一次虚拟地址 0xffffffffc02000d8 的 TLB miss，并确认页级映射
+   0xffffffffc0200000 -> 0x80200000；
+2. 说明 get_physical_address 的关键分支和 Sv39 三次循环中 VPN2/VPN1/VPN0 的提取；
+3. 说明 get_page_addr_code 先查 TLB，tlb_hit 失败后才调用 tlb_fill；
+4. 对比 Bare 路径和 Sv39 路径：Bare 直接返回原地址，Sv39 执行三级页表遍历；
+5. 记录有意义的调试细节，以及 AI 如何帮助定位源码、修正 GDB 脚本和解释循环。
 
 Failure：
-若断点先命中低位地址，应增加 address >= 0xffffffffc0000000 条件。
+若断点先命中低位地址，应增加 address >= 0xffffffffc0000000 条件；
+若 QEMU 无调试符号，应重新构建 --enable-debug 版本，不能继续使用 strip 后的预编译程序。
 ```
 
 **实际结果：**
