@@ -529,7 +529,7 @@ static void buddy_check(void);
 
 ---
 
-### 4.3 选做 Challenge
+### 4.3 Challenge
 
 #### 4.3.1 Challenge：操作系统如何自行获取可用物理内存范围
 
