@@ -7,6 +7,7 @@
 #include <mmu.h>
 #include <riscv.h>
 #include <stdio.h>
+#include <sbi.h>
 #include <trap.h>
 
 #define TICK_NUM 100
@@ -81,6 +82,57 @@ void print_regs(struct pushregs *gpr) {
 }
 
 //lab3 function2 YOUR CODE
+/* ---------------------------------------------------------------
+ * Liu Shuang (2411350): interrupt_handler()
+ * Only interrupts are handled here.  Exceptions belong to
+ * exception_handler() and are deliberately untouched.
+ * --------------------------------------------------------------- */
+
+/* Power the system down after 300 ticks.  Must be > 200, otherwise
+ * Test 3's PASS line (which is printed when ticks reaches 200) would
+ * never appear because QEMU shuts down inside the interrupt. */
+#define SHUTDOWN_AFTER 300
+
+/* interrupt_handler - dispatch every supervisor interrupt by tf->cause.
+ *
+ * RISC-V scause: bit63 == 1 means an interrupt (asynchronous), the low
+ * bits hold the interrupt code.  The test harness calls us directly
+ * with a synthetic tf (e.g. cause = 15), so we always mask off bit63
+ * instead of relying on it being set. */
+void interrupt_handler(struct trapframe *tf) {
+    uintptr_t cause_code = tf->cause & (((uintptr_t)1 << 63) - 1);
+
+    switch (cause_code) {
+    case IRQ_S_TIMER: {
+        /* 1) one supervisor timer tick */
+        ticks++;
+
+        /* 2) print a statistics line every TICK_NUM ticks */
+        if (ticks % TICK_NUM == 0) {
+            print_ticks();
+        }
+
+        /* 3) re-arm the next timer event, otherwise only one interrupt
+         *    ever arrives */
+        clock_set_next_event();
+
+        /* 4) shut the system down once enough ticks have accumulated */
+        if (ticks >= SHUTDOWN_AFTER) {
+            sbi_shutdown();
+        }
+        break;
+    }
+
+    case IRQ_S_SOFT:
+        cprintf("Supervisor software interrupt\n");
+        break;
+
+    default:
+        cprintf("Unknown interrupt: cause %d\n", (int)cause_code);
+        print_trapframe(tf);
+        break;
+    }
+}
 
 
 static inline void trap_dispatch(struct trapframe *tf) {
