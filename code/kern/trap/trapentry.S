@@ -56,7 +56,53 @@
 
     .macro RESTORE_ALL
 
-    #lab3 function1 YOUR CODE
+    #lab3 function1 2411822
+    # Restore the special CSRs before overwriting the general registers.
+    LOAD s0, 2*REGBYTES(sp)
+    csrw sscratch, s0
+
+    LOAD s1, 32*REGBYTES(sp)
+    csrw sstatus, s1
+    LOAD s2, 33*REGBYTES(sp)
+    csrw sepc, s2
+    LOAD s3, 34*REGBYTES(sp)
+    csrw sbadaddr, s3
+    LOAD s4, 35*REGBYTES(sp)
+    csrw scause, s4
+
+    LOAD x1, 1*REGBYTES(sp)
+    LOAD x3, 3*REGBYTES(sp)
+    LOAD x4, 4*REGBYTES(sp)
+    LOAD x5, 5*REGBYTES(sp)
+    LOAD x6, 6*REGBYTES(sp)
+    LOAD x7, 7*REGBYTES(sp)
+    LOAD x8, 8*REGBYTES(sp)
+    LOAD x9, 9*REGBYTES(sp)
+    LOAD x10, 10*REGBYTES(sp)
+    LOAD x11, 11*REGBYTES(sp)
+    LOAD x12, 12*REGBYTES(sp)
+    LOAD x13, 13*REGBYTES(sp)
+    LOAD x14, 14*REGBYTES(sp)
+    LOAD x15, 15*REGBYTES(sp)
+    LOAD x16, 16*REGBYTES(sp)
+    LOAD x17, 17*REGBYTES(sp)
+    LOAD x18, 18*REGBYTES(sp)
+    LOAD x19, 19*REGBYTES(sp)
+    LOAD x20, 20*REGBYTES(sp)
+    LOAD x21, 21*REGBYTES(sp)
+    LOAD x22, 22*REGBYTES(sp)
+    LOAD x23, 23*REGBYTES(sp)
+    LOAD x24, 24*REGBYTES(sp)
+    LOAD x25, 25*REGBYTES(sp)
+    LOAD x26, 26*REGBYTES(sp)
+    LOAD x27, 27*REGBYTES(sp)
+    LOAD x28, 28*REGBYTES(sp)
+    LOAD x29, 29*REGBYTES(sp)
+    LOAD x30, 30*REGBYTES(sp)
+    LOAD x31, 31*REGBYTES(sp)
+
+    # Restore sp last because the frame is addressed through it.
+    LOAD x2, 2*REGBYTES(sp)
 
     .endm
 
@@ -65,8 +111,11 @@
 __alltraps:
     SAVE_ALL
 
-    #lab3 function1 YOUR CODE
-    # sp should be the same as before "jal trap"
+    #lab3 function1 2411822
+    # Pass the current Trap frame as trap(struct trapframe *tf).
+    mv a0, sp
+    jal trap
+    j __trapret
 
     .globl __trapret
 __trapret:
