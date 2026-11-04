@@ -81,11 +81,10 @@ void print_regs(struct pushregs *gpr) {
     cprintf("  t6       0x%08x\n", gpr->t6);
 }
 
-//lab3 function2 YOUR CODE
+//lab3 function2 2411350
 /* ---------------------------------------------------------------
  * Liu Shuang (2411350): interrupt_handler()
- * Only interrupts are handled here.  Exceptions belong to
- * exception_handler() and are deliberately untouched.
+ * Only interrupts are handled here.  
  * --------------------------------------------------------------- */
 
 /* Power the system down after 300 ticks.  Must be > 200, otherwise
@@ -134,6 +133,47 @@ void interrupt_handler(struct trapframe *tf) {
     }
 }
 
+//lab3 function3 2413423
+/* ---------------------------------------------------------------
+ * exception_handler(): handle supervisor exceptions.
+ *
+ * Case illegal instruction / breakpoint:
+ *   print a grading-recognizable record with the faulting address,
+ *   then advance tf->epc by the real length of the faulting
+ *   instruction so it will not be re-executed on return.
+ * Case other:
+ *   leave epc untouched and dump the whole trapframe.
+ * --------------------------------------------------------------- */
+
+/* trap_insn_len - return the byte length of the instruction at epc.
+ * RVC: the low 2 bits == 0b11 means a 32-bit instruction, otherwise
+ * the instruction is a 16-bit compressed one. */
+static size_t
+trap_insn_len(uintptr_t epc) {
+    unsigned short insn = *(unsigned short *)epc;
+    return ((insn & 0x3) == 0x3) ? 4 : 2;
+}
+
+void
+exception_handler(struct trapframe *tf) {
+    switch (tf->cause) {
+    case CAUSE_ILLEGAL_INSTRUCTION: {   /* cause = 2 */
+        cprintf("Illegal instruction at 0x%08x\n", tf->epc);
+        tf->epc += trap_insn_len(tf->epc);  /* skip faulting insn */
+        break;
+    }
+
+    case CAUSE_BREAKPOINT: {            /* cause = 3, ebreak */
+        cprintf("Breakpoint at 0x%08x\n", tf->epc);
+        tf->epc += trap_insn_len(tf->epc);  /* resume after ebreak */
+        break;
+    }
+
+    default:                            /* unhandled exception: dump frame */
+        print_trapframe(tf);
+        break;
+    }
+}
 
 static inline void trap_dispatch(struct trapframe *tf) {
     if ((intptr_t)tf->cause < 0) {
