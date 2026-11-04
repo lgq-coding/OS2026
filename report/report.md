@@ -269,7 +269,7 @@ Post-Condition:
 
 #### 验证状态
 
-Lab3 全部模块合并后运行 Test 3（持续时钟中断与多次 Trap 返回），结果 PASS (40/40, `ticks=200`)：时钟中断持续重新武装、`ticks` 按次累计并周期性输出 `100 ticks`、达到关机条件后正常关机；Test 2 中软件中断输出 `Supervisor software interrupt`、未知中断兜底输出 `Unknown interrupt: cause 15` 均验证通过。
+Lab3 全部模块合并后运行 Test 3（持续时钟中断与多次 Trap 返回），结果 PASS (40/40, `ticks=200`)：时钟中断持续重新武装、`ticks` 按次累计并周期性输出 `100 ticks`；达到关机条件后调用 `sbi_shutdown()`，在课程使用的 QEMU 4.1.1 调试版上可由 OpenSBI 正常关停。Test 2 中软件中断输出 `Supervisor software interrupt`、未知中断兜底输出 `Unknown interrupt: cause 15` 均验证通过。
 
 ---
 
@@ -485,9 +485,11 @@ void exception_handler(struct trapframe *tf);
 
 ### 5.1 测试环境说明
 
-测试在 WSL2 中 `~/OS2026/code` 目录下执行。
+测试在 WSL2 中 `~/OS2026/code` 目录下执行，最终验证使用课程配套的 QEMU 4.1.1 调试版。
 
 与 Lab2 相同，Windows 工作区 Git 的 `core.autocrlf` 使 `tools/grade.sh` 被检出为 CRLF，WSL 的 `/bin/sh` 无法解析行尾 `\r`，首次运行 `make grade` 报语法错误。转换换行符后恢复正常。
+
+若直接使用 QEMU 5.1 自带的 OpenSBI 0.7，`sbi_shutdown()` 访问 `0x100000` 的 SiFive test finisher 时会触发 M-mode store access fault：OpenSBI 使用 16 位写，而 QEMU 5.1 中该 MMIO 设备只接受 32 位访问。这是固件与模拟器的兼容性问题，不属于 uCore 的 Trap 处理错误，也不影响 `make grade` 的评分结果。
 
 ### 5.2 测试矩阵
 
@@ -496,7 +498,7 @@ void exception_handler(struct trapframe *tf);
 | 测试                                                        | 验证内容                                                      | 主要负责人 | 协作人 | 结果           |
 | --------------------------------------------------------- | --------------------------------------------------------- | ----- | --- | ------------ |
 | Test 1：trap entry, register restore, and breakpoint EPC   | Trap 入口完整流程、`ebreak` 触发断点异常后寄存器上下文恢复、断点 EPC 推进            | 刘国全   | 王乐妍 | PASS (35/35) |
-| Test 2：illegal instruction EPC advance and return         | 非法指令异常识别与输出、按指令长度推进 EPC 并正确返回、未知异常兜底（含直接注入 cause=20 的合成帧） | 王乐妍   | 刘爽  | PASS (25/25) |
+| Test 2：illegal instruction EPC advance and return         | 非法指令异常识别与输出、按 4 字节非法指令长度推进 EPC 并正确返回、未知异常兜底（含直接注入 cause=20 的合成帧） | 王乐妍   | 刘爽  | PASS (25/25) |
 | Test 3：re-armed supervisor timer and repeated trap return | 时钟中断持续触发与重新武装、`ticks` 累计、多次 Trap 返回、关机条件                  | 刘爽    | 刘国全 | PASS (40/40) |
 
 ### 5.3 测试结果
@@ -522,7 +524,7 @@ re-armed supervisor timer and repeated trap return:    PASS (40/40)
 Total Score: 100/100
 ```
 
-Test 1/2 的联合验证说明：Test 1 通过断点异常验证了"汇编入口 → `trap()` → 异常分支 → 修改 `epc` → `RESTORE_ALL` → `sret` 返回后寄存器与 `epc` 均为预期值"的完整链路，其中"断点 EPC 推进"与"`Breakpoint at` 输出"正是 `exception_handler` 断点分支的行为；Test 2 进一步单独验证非法指令分支的压缩指令长度判断与未知异常兜底。两个测试共同确认了异常处理模块在真实 Trap 路径与合成 Trap frame 两种输入下行为一致。
+Test 1/2 的联合验证说明：Test 1 通过断点异常验证了"汇编入口 → `trap()` → 异常分支 → 修改 `epc` → `RESTORE_ALL` → `sret` 返回后寄存器与 `epc` 均为预期值"的完整链路，其中"断点 EPC 推进"与"`Breakpoint at` 输出"正是 `exception_handler` 断点分支的行为；Test 2 使用 `.word 0x0000007b`（低两位为 `0b11`）验证 4 字节非法指令的长度判断与未知异常兜底。当前自动测试未覆盖 2 字节 RVC 路径，该路径由指令编码规则和实现代码审查确认。
 
 ---
 
