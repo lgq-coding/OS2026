@@ -83,9 +83,69 @@ void print_regs(struct pushregs *gpr)
 
 extern struct mm_struct *check_mm_struct;
 
-//lab3 请补充你在lab3中的代码
+//lab3 function2 2411350
+// interrupt_handler - dispatch supervisor interrupts by tf->cause.
+void interrupt_handler(struct trapframe *tf)
+{
+    uintptr_t cause_code = tf->cause & (((uintptr_t)1 << 63) - 1);
 
+    switch (cause_code)
+    {
+    case IRQ_S_TIMER:
+        /* 1) one supervisor timer tick */
+        ticks++;
 
+        /* 2) print a statistics line every TICK_NUM ticks */
+        if (ticks % TICK_NUM == 0)
+        {
+            print_ticks();
+        }
+
+        /* 3) re-arm the next timer event, otherwise only one
+         *    interrupt ever arrives */
+        clock_set_next_event();
+        break;
+
+    case IRQ_S_SOFT:
+        cprintf("Supervisor software interrupt\n");
+        break;
+
+    default:
+        cprintf("Unknown interrupt: cause %d\n", (int)cause_code);
+        print_trapframe(tf);
+        break;
+    }
+}
+
+//lab3 function3 2413423
+// trap_insn_len - return the byte length of the instruction at epc.
+static size_t
+trap_insn_len(uintptr_t epc)
+{
+    unsigned short insn = *(unsigned short *)epc;
+    return ((insn & 0x3) == 0x3) ? 4 : 2;
+}
+
+// exception_handler - handle exceptions; skip faulting insn by epc advance.
+void exception_handler(struct trapframe *tf)
+{
+    switch (tf->cause)
+    {
+    case CAUSE_ILLEGAL_INSTRUCTION: /* cause = 2 */
+        cprintf("Illegal instruction at 0x%08x\n", tf->epc);
+        tf->epc += trap_insn_len(tf->epc);
+        break;
+
+    case CAUSE_BREAKPOINT: /* cause = 3, ebreak */
+        cprintf("Breakpoint at 0x%08x\n", tf->epc);
+        tf->epc += trap_insn_len(tf->epc);
+        break;
+
+    default: /* unhandled exception: dump frame */
+        print_trapframe(tf);
+        break;
+    }
+}
 
 /* *
  * trap - handles or dispatches an exception/interrupt. if and when trap()
