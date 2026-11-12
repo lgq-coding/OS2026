@@ -87,7 +87,62 @@ size_t nr_free_pages(void)
     return ret;
 }
 
-//lab2 请补充你在lab2中的代码
+//lab2 function1 2411822
+static void
+page_init(void)
+{
+    extern char end[];
+
+    uint64_t mem_base = get_memory_base();
+    uint64_t mem_size = get_memory_size();
+    uint64_t mem_end = mem_base + mem_size;
+
+    if (mem_base < DRAM_BASE || mem_size == 0 || mem_end <= mem_base)
+    {
+        panic("page_init: invalid physical memory range [0x%016lx, 0x%016lx)",
+              mem_base, mem_end);
+    }
+
+    va_pa_offset = PHYSICAL_MEMORY_OFFSET;
+    npage = PPN(mem_end);
+    if (npage <= nbase)
+    {
+        panic("page_init: no manageable physical memory");
+    }
+
+    pages = (struct Page *)ROUNDUP((uintptr_t)end, PGSIZE);
+    size_t nr_pages = npage - nbase;
+    uintptr_t pages_end_va = (uintptr_t)pages + nr_pages * sizeof(struct Page);
+    uintptr_t pages_end_pa = PADDR(pages_end_va);
+
+    if (pages_end_pa > mem_end)
+    {
+        panic("page_init: Page descriptor array exceeds physical memory");
+    }
+
+    for (struct Page *p = pages; p < pages + nr_pages; p++)
+    {
+        p->flags = 0;
+        p->property = 0;
+        set_page_ref(p, 0);
+        SetPageReserved(p);
+    }
+
+    uintptr_t free_start_pa = ROUNDUP(pages_end_pa, PGSIZE);
+    uintptr_t free_end_pa = ROUNDDOWN(mem_end, PGSIZE);
+
+    cprintf("physical memory map:\n");
+    cprintf("memory: 0x%016lx, [0x%016lx, 0x%016lx].\n",
+            mem_size, mem_base, mem_end - 1);
+
+    if (free_start_pa < free_end_pa)
+    {
+        struct Page *base = pa2page(free_start_pa);
+        size_t free_pages = (free_end_pa - free_start_pa) / PGSIZE;
+        init_memmap(base, free_pages);
+    }
+}
+
 
 static void enable_paging(void)
 {
