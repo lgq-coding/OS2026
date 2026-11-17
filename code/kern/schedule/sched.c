@@ -16,31 +16,55 @@ void
 schedule(void) {
     bool intr_flag;
     struct proc_struct *next = idleproc;
-    current->need_resched = 0;
 
     local_intr_save(intr_flag);
     {
-        list_entry_t *le;
-        if (current != idleproc) {
-            le = list_next(&(current->list_link));
+        current->need_resched = 0;
+
+        list_entry_t *head = &proc_list;
+        list_entry_t *start;
+
+        /*
+         * Round-robin search starts after the current process.  If the
+         * current process is the last node, start from the first node
+         * instead of stopping at the list head.
+         */
+        if (current == idleproc) {
+            start = list_next(head);
         } else {
-            le = list_next(&proc_list);
+            start = list_next(&(current->list_link));
+            if (start == head) {
+                start = list_next(head);
+            }
         }
-        // 从起点循环遍历整个 proc_list，找第一个 PROC_RUNNABLE 的线程
-        while (le != &proc_list) {
+
+        list_entry_t *le = start;
+        do {
+            if (le == head) {
+                le = list_next(head);
+                if (le == start) {
+                    break;
+                }
+                continue;
+            }
+
             struct proc_struct *p = le2proc(le, list_link);
-            if (p->state == PROC_RUNNABLE) {
+            /*
+             * idleproc is the fallback only.  Do not let it preempt a
+             * real runnable thread, and do not select the current thread.
+             */
+            if (p != idleproc && p != current && p->state == PROC_RUNNABLE) {
                 next = p;
                 break;
             }
             le = list_next(le);
-        }
-        // 整个链表无可运行线程时，next 保持为 idleproc
+        } while (le != start);
+
+        /* If no other thread is runnable, fall back to idleproc. */
         if (next == current) {
             local_intr_restore(intr_flag);
             return;
         }
-        // runs++ 由 proc_run() 负责（分工 B5 第 4 步），此处不重复计数
         proc_run(next);
     }
     local_intr_restore(intr_flag);
