@@ -216,65 +216,87 @@ get_pte(..., 1) 失败时返回 -E_NO_MEM；
 
 **负责人：**2411350-刘爽
 
-**使用目的：**完成 PCB 初始化、`idleproc`/`initproc` 创建、内核栈分配和首次运行上下文构造。
+**使用目的：**完成 PCB 初始化、`idleproc`/`initproc` 创建、内核栈分配与首次运行上下文构造，并实现 `cpu_idle()`、`proc_run()` 两个调度接口；让新线程第一次被调度时能沿 `forkret -> forkrets -> __trapret -> sret -> kernel_thread_entry -> fn(arg)` 链路运行。
 
 ### Prompt
 
 ```text
 [PROMPT]
-在 kern/process/proc.c 中实现 alloc_proc()、proc_init()、kernel_thread()、
-do_fork()、copy_thread() 和 copy_mm()。要求创建 idleproc 和 initproc，
-正确初始化 PCB 字段、内核栈、Trap frame 和 context，并使 initproc
-第一次被调度时依次经过 forkret、forkrets、__trapret、kernel_thread_entry。
+在 code/kern/process/proc.c 中实现两组函数：
+1) 创建与初始化：alloc_proc()、proc_init()、kernel_thread()、
+   do_fork()、copy_thread()、copy_mm()；
+2) 调度接口：cpu_idle()、proc_run()。
+要求：创建 idleproc（pid=0，复用 bootstack）和 initproc（pid=1，父进程为
+idleproc）；正确初始化 PCB 字段、内核栈、Trap frame 与 context；
+do_fork 按 alloc_proc -> setup_kstack -> copy_mm -> copy_thread ->
+get_pid/hash_proc/list_add/nr_process++ -> wakeup_proc 的顺序组合资源，
+失败按逆序释放；kernel_thread 伪造 trapframe，使 epc=kernel_thread_entry、
+s0=fn、s1=arg；copy_thread 将 tf 放在内核栈顶，context.ra=forkret、
+context.sp=tf；proc_run 在关中断临界区内更新 current、切换 satp 并调用
+switch_to；cpu_idle 在 need_resched 为真时调用 schedule。不要修改测试函数、
+inject.py 或 grade.sh。
 
 [RELY]
 - struct proc_struct、struct context、struct trapframe
 - proc_list、hash_list、current、idleproc、initproc、nr_process
-- kmalloc、kfree、alloc_pages、free_pages
-- page2kva、kva2page、bootstack、boot_pgdir_pa
-- get_pid、hash_proc、find_proc、set_proc_name
-- wakeup_proc、setup_kstack、put_kstack
-- kernel_thread_entry、forkret、forkrets
-- read_csr(sstatus)、SSTATUS_SPP、SSTATUS_SPIE、SSTATUS_SIE
+- PROC_UNINIT / PROC_RUNNABLE、MAX_PROCESS、HASH_LIST_SIZE、KSTACKSIZE
+- kmalloc、kfree、setup_kstack、put_kstack、alloc_pages、free_pages
+- bootstack、boot_pgdir_pa、page2kva、kva2page
+- get_pid、hash_proc、find_proc、set_proc_name、wakeup_proc
+- kernel_thread_entry、forkret、forkrets、__trapret、switch_to、schedule
+- read_csr(sstatus)、write_csr(satp)、SSTATUS_SPP、SSTATUS_SPIE、SSTATUS_SIE、
+  RISCV_PGSHIFT
+- local_intr_save、local_intr_restore
+- list_init、list_add
 
 [GUARANTEE]
-派生：
-- alloc_proc()
-- proc_init()
-- kernel_thread()
-- do_fork()
-- copy_thread()
-- copy_mm()
+必须实现并保持签名：
+- static struct proc_struct *alloc_proc(void);
+- void proc_init(void);
+- int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags);
+- int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf);
+- static void copy_thread(struct proc_struct *proc, uintptr_t stack, struct trapframe *tf);
+- static int copy_mm(uint32_t clone_flags, struct proc_struct *proc);
+- void cpu_idle(void);
+- void proc_run(struct proc_struct *proc);
 
 [SPECIFICATION]
 Pre-Condition：
 current 指向创建线程的父执行流；
-内核堆和物理页分配器已初始化；
-proc_list 和 PID 哈希表尚未初始化或需要重新初始化。
+内核堆与物理页分配器已初始化；
+proc_list 与 PID 哈希表尚未初始化或需要重新初始化；
+switch_to、schedule 由其他模块提供。
 
 Post-Condition：
-alloc_proc 返回字段全部初始化的 PCB；
-idleproc 的 pid=0、state=PROC_RUNNABLE、kstack=bootstack；
+alloc_proc 返回字段全部初始化的 PCB，context 与两个链表节点清零/自链；
+idleproc 的 pid=0、state=PROC_RUNNABLE、kstack=bootstack、need_resched=1；
 current 指向 idleproc；
 initproc 的 pid=1、state=PROC_RUNNABLE、parent=idleproc；
 initproc 已加入 proc_list 和 PID 哈希表；
-initproc 的 tf 位于自己的内核栈顶部；
-initproc 的 context.ra 指向 forkret；
-initproc 的 context.sp 指向其 Trap frame；
-kernel_thread 构造的 Trap frame 中 epc=kernel_thread_entry，
-s0=fn，s1=arg，a0=0。
+initproc 的 tf 位于自己内核栈顶部；
+initproc 的 context.ra 指向 forkret，context.sp 指向其 Trap frame；
+kernel_thread 构造的 trapframe 中 epc=kernel_thread_entry、s0=fn、s1=arg、
+a0=0，status 的 SPP=1、SPIE=1、SIE=0；
+copy_mm 对内核线程置 mm=NULL、pgdir=boot_pgdir_pa；
+proc_run 在同一进程时直接返回；切换时 current、runs、satp 与上下文一致；
+cpu_idle 循环检查 need_resched，为真时调用 schedule()。
 
 Failure：
 PCB 分配失败返回 NULL；
-内核栈分配失败时释放 PCB；
-copy_mm 失败时释放内核栈和 PCB；
-不能把 pid=-1、未挂接或无 Trap frame 的进程设为 RUNNABLE。
+内核栈分配失败释放 PCB；
+copy_mm 失败释放内核栈与 PCB；
+不能把 pid=-1、未挂接或无 Trap frame 的进程置为 RUNNABLE；
+PID 分配、入链表与入哈希表必须在关中断临界区内完成；
+proc_run 不能在切换中途让 current 与 satp 不一致；
+同一进程重复进入 proc_run 必须直接返回；
+不得通过修改测试或评分脚本来制造通过结果。
 ```
 
 ### 结果
 
-- `[Test Process Create] PASS`。
-- `initproc` 能通过首次运行链进入 `init_main`。
+- `alloc_proc()`、`proc_init()`、`kernel_thread()`、`do_fork()`、`copy_thread()`、`copy_mm()`、`cpu_idle()`、`proc_run()` 编译通过。
+- `[Test Process Create] PASS`，`initproc` 能通过首次运行链进入 `init_main`。
+- `proc_run()` 与 `switch_to()` 配合完成上下文与页表切换；`schedule()` 的环形扫描修复见 P06。
 
 ---
 

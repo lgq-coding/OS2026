@@ -230,9 +230,12 @@ check_boot_pgdir() succeeded!
 
 #### 4.2.1 功能说明
 
-本模块负责创建 PCB、分配内核栈、构造首次运行 Trap frame，并把新线程挂入进程链表和 PID 哈希表。
+本模块的函数分为两组：
 
-主要函数：
+- **进程创建与初始化**：`alloc_proc()`、`proc_init()`、`kernel_thread()`、`do_fork()`、`copy_thread()`、`copy_mm()`；
+- **调度接口**：`cpu_idle()`、`proc_run()`。真正“选谁运行”由王乐妍实现的 `schedule()` 完成；这两个函数只负责“空闲时让出 CPU”和“真正完成一次上下文与页表切换”，调度算法与 `switch_to()` 见 4.3 节。
+
+函数原型：
 
 ```c
 static struct proc_struct *alloc_proc(void);
@@ -241,57 +244,266 @@ int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags);
 int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf);
 static void copy_thread(struct proc_struct *proc, uintptr_t stack, struct trapframe *tf);
 static int copy_mm(uint32_t clone_flags, struct proc_struct *proc);
+void cpu_idle(void);
+void proc_run(struct proc_struct *proc);
 ```
 
-#### 4.2.2 核心实现
+整体职责链：
 
-`alloc_proc()` 必须把 PCB 所有字段初始化到安全状态：
+```text
+proc_init
+  -> alloc_proc(idleproc)
+  -> kernel_thread(init_main, "Hello world!!", 0)
+       -> do_fork
+            -> alloc_proc -> setup_kstack -> copy_mm -> copy_thread
+            -> 关中断: get_pid -> hash_proc -> list_add -> nr_process++
+            -> wakeup_proc
+```
+
+#### 4.2.2 PCB 字段说明
+
+`struct proc_struct` 是内核管理一个线程/进程的唯一实体，各字段含义与本模块的初值来源如下：
+
+| 字段 | 含义 | 初值 / 来源 |
+|------|------|-------------|
+| `state` | 进程状态：`PROC_UNINIT` / `PROC_SLEEPING` / `PROC_RUNNABLE` / `PROC_ZOMBIE` | `PROC_UNINIT`，`wakeup_proc()` 后改为 `PROC_RUNNABLE` |
+| `pid` | 进程号 | `alloc_proc` 置 `-1`，`get_pid()` 分配；`idleproc` 固定为 0 |
+| `runs` | 被调度运行的次数 | 0，`proc_run()` 中 `runs++` |
+| `kstack` | 内核栈物理地址 | `setup_kstack()` 分配；`idleproc` 复用 `bootstack` |
+| `need_resched` | 是否需要被抢占调度 | 0；`idleproc` 置 1，进入 `cpu_idle` 后立即让出 |
+| `parent` | 父进程指针 | `do_fork()` 中记为 `current` |
+| `mm` | 用户地址空间管理结构 | 内核线程为 `NULL` |
+| `context` | 上下文切换时保存的最小寄存器现场（`ra`、`sp`、`s0~s11`） | `memset` 清零 |
+| `tf` | 中断帧 `struct trapframe *` | `copy_thread()` 指向内核栈顶的 trapframe |
+| `pgdir` | 页目录物理地址 | 默认沿用 `boot_pgdir_pa` |
+| `flags` | 进程标志 | 0 |
+| `name` | 进程名（`PROC_NAME_LEN + 1`） | `memset` 清空，`set_proc_name()` 命名 |
+| `list_link` | 就绪/进程双向链表节点 | `list_init` 自成空链 |
+| `hash_link` | PID 哈希表节点 | `list_init` 自成空链 |
+
+#### 4.2.3 核心实现
+
+##### （1）`alloc_proc()`：PCB 显式初始化
+
+PCB 本身用 `kmalloc` 从内核堆上分配；此时还没有内核栈、没有 PID，所有字段都必须显式赋初值，不能依赖 `kmalloc` 返回的内存内容：
 
 ```c
-proc->state = PROC_UNINIT;
-proc->pid = -1;
-proc->runs = 0;
-proc->kstack = 0;
-proc->need_resched = 0;
-proc->parent = NULL;
-proc->mm = NULL;
-memset(&proc->context, 0, sizeof(struct context));
-proc->tf = NULL;
-proc->pgdir = boot_pgdir_pa;
-proc->flags = 0;
-memset(proc->name, 0, sizeof(proc->name));
+static struct proc_struct *
+alloc_proc(void)
+{
+    struct proc_struct *proc = (struct proc_struct *)kmalloc(sizeof(struct proc_struct));
+    if (proc == NULL)
+    {
+        return NULL;
+    }
+
+    proc->state = PROC_UNINIT;                              // 尚未初始化
+    proc->pid = -1;                                         // 尚未分配 pid
+    proc->runs = 0;                                         // 还未被调度过
+    proc->kstack = 0;                                       // 内核栈稍后由 setup_kstack 分配
+    proc->need_resched = 0;                                 // 不需要被抢占
+    proc->parent = NULL;                                    // 父进程稍后设置
+    proc->mm = NULL;                                        // 内核线程没有用户地址空间
+    memset(&(proc->context), 0, sizeof(struct context));    // 上下文清零（含 ra）
+    proc->tf = NULL;                                        // 中断帧稍后由 copy_thread 设置
+    proc->pgdir = boot_pgdir_pa;                            // 默认沿用内核页目录（物理地址）
+    proc->flags = 0;                                        // 无特殊标志
+    memset(proc->name, 0, sizeof(proc->name));              // 名字清空
+    list_init(&(proc->list_link));                          // 链表节点自成一个空链
+    list_init(&(proc->hash_link));                          // 哈希节点自成空链
+
+    return proc;
+}
 ```
 
-`proc_init()` 的主要步骤：
+要点：`context` 用 `memset` 整块清零，保证 `context.ra` 初始为 0；两个链表节点必须 `list_init`，否则后续 `list_add` / `list_next` 会遍历到野指针。
 
-1. 初始化 `proc_list` 和 PID 哈希表。
-2. 创建 `idleproc`，设置 PID 为 0，复用 `bootstack`，并设置 `need_resched = 1`。
-3. 设置 `current = idleproc`。
-4. 调用 `kernel_thread(init_main, "Hello world!!", 0)` 创建 `initproc`。
-5. 设置 `initproc` 的名称为 `"init"`。
+##### （2）`copy_mm()`：内核线程无独立地址空间
 
-`kernel_thread()` 构造一个临时 Trap frame：
+Lab4 创建的全部是内核线程（`idleproc` 与 `initproc`），`current->mm == NULL`，因此不需要复制用户地址空间：
 
 ```c
-tf.gpr.s0 = (uintptr_t)fn;
-tf.gpr.s1 = (uintptr_t)arg;
-tf.epc = (uintptr_t)kernel_thread_entry;
-tf.status = (read_csr(sstatus) | SSTATUS_SPP | SSTATUS_SPIE)
-            & ~SSTATUS_SIE;
+static int
+copy_mm(uint32_t clone_flags, struct proc_struct *proc)
+{
+    (void)clone_flags;
+
+    if (current->mm == NULL)
+    {
+        proc->mm = NULL;
+        proc->pgdir = boot_pgdir_pa;
+        return 0;
+    }
+
+    /* 用户进程的地址空间复制属于后续实验内容，Lab4 不涉及。 */
+    proc->mm = NULL;
+    proc->pgdir = boot_pgdir_pa;
+    return 0;
+}
 ```
 
-`copy_thread()` 把 Trap frame 放到新线程内核栈顶部，并设置：
+接口按完整 fork 流程保留，便于后续实验扩展用户进程地址空间复制；`pgdir` 沿用内核页目录物理地址。
+
+##### （3）`copy_thread()`：构造新线程的首次运行现场
+
+在内核栈顶端留出一个 `struct trapframe`，把模板（`kernel_thread` 伪造的中断帧）复制进去，并设置切换上下文：
 
 ```c
-proc->tf = (struct trapframe *)(proc->kstack + KSTACKSIZE) - 1;
-*proc->tf = *tf;
-proc->tf->gpr.a0 = 0;
-proc->tf->gpr.sp = (uintptr_t)proc->tf;
-proc->context.ra = (uintptr_t)forkret;
-proc->context.sp = (uintptr_t)proc->tf;
+static void
+copy_thread(struct proc_struct *proc, uintptr_t stack, struct trapframe *tf)
+{
+    (void)stack;
+
+    // 内核栈顶减去一个 trapframe，得到本进程 trapframe 的起始地址
+    proc->tf = (struct trapframe *)(proc->kstack + KSTACKSIZE) - 1;
+
+    // 复制父进程/模板的中断帧
+    *(proc->tf) = *tf;
+
+    // 子进程的返回值：a0 = 0
+    proc->tf->gpr.a0 = 0;
+
+    // 新线程第一次被 sret 返回时使用的栈指针（栈向下增长，
+    // 该地址之上就是 trapframe，函数栈帧不会破坏 tf）
+    proc->tf->gpr.sp = (uintptr_t)(proc->tf);
+
+    // 首次被 switch_to 换入时，从 forkret 开始执行
+    proc->context.ra = (uintptr_t)forkret;
+    proc->context.sp = (uintptr_t)(proc->tf);
+}
 ```
 
-新线程第一次被调度时，执行链为：
+内核栈与 trapframe 的布局（栈向下增长）：
+
+```text
+高地址  kstack + KSTACKSIZE
+        +----------------------+
+        |  struct trapframe     |  <- proc->tf
+        +----------------------+
+        |  后续函数栈帧向下生长  |
+低地址  kstack
+```
+
+字段设置的含义：
+
+- `tf->gpr.a0 = 0`：子进程从 fork 返回 0（父进程返回子 PID）；
+- `tf->gpr.sp = tf`：`sret` 后使用的栈指针指向自己的 trapframe；
+- `context.ra = forkret`：`switch_to` 恢复后先跳到 `forkret`；
+- `context.sp = tf`：切换时 `sp` 指向该 trapframe。
+
+##### （4）`do_fork()`：资源申请顺序与逆序释放
+
+`do_fork()` 按固定顺序组合资源，任何一步失败都按“已获得资源的逆序”释放：
+
+```text
+alloc_proc -> 记录 parent -> setup_kstack -> copy_mm -> copy_thread
+  -> 关中断: get_pid -> hash_proc -> list_add -> nr_process++
+  -> wakeup_proc
+```
+
+失败回退标签：
+
+| 失败点 | 回退动作 |
+|--------|----------|
+| `alloc_proc` 失败 | 直接 `fork_out`，返回 `-E_NO_MEM` |
+| `setup_kstack` 失败 | `goto bad_fork_cleanup_proc`：`kfree(proc)` |
+| `copy_mm` 失败 | `goto bad_fork_cleanup_kstack`：`put_kstack(proc)` → `kfree(proc)` |
+
+PID 分配、入哈希表、入进程链表和 `nr_process++` 放在 `local_intr_save` 临界区内，保证这组对共享链表/哈希表的修改是原子的；最后 `wakeup_proc(proc)` 把状态置为 `PROC_RUNNABLE`，等待调度器选中。
+
+##### （5）`kernel_thread()`：伪造首次运行的 trapframe
+
+RISC-V 没有 x86 那样用 `iret` 造栈的技巧，这里直接伪造一个 `trapframe`，让 `sret` 之后跳到 `kernel_thread_entry`，由它执行 `a0 = s1(arg)`、`jalr s0(fn)`：
+
+```c
+int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags)
+{
+    struct trapframe tf;
+
+    memset(&tf, 0, sizeof(struct trapframe));
+
+    tf.gpr.s0 = (uintptr_t)fn;                        // kernel_thread_entry: jalr s0
+    tf.gpr.s1 = (uintptr_t)arg;                       // kernel_thread_entry: a0 = s1
+    tf.epc = (uintptr_t)kernel_thread_entry;          // sret 的落点
+    // 从 S 态返回 S 态(SPP=1)，返回后开中断(SPIE=1)，当前关中断(SIE=0)
+    tf.status = (read_csr(sstatus) | SSTATUS_SPP | SSTATUS_SPIE) & ~SSTATUS_SIE;
+
+    return do_fork(clone_flags, 0, &tf);
+}
+```
+
+`tf.status` 三个状态位的作用：
+
+- `SSTATUS_SPP = 1`：`sret` 返回后仍处于内核态（S 态）；
+- `SSTATUS_SPIE = 1`：返回后按进入前的中断使能状态恢复；
+- `SSTATUS_SIE = 0`：进入线程时先关中断，避免创建过程中被打断。
+
+函数地址放 `s0`、参数放 `s1`，是与汇编入口 `kernel_thread_entry` 的约定：它先 `move a0, s1` 取参数，再 `jalr s0` 调函数。
+
+##### （6）`proc_init()`：建立 0 号、1 号进程
+
+1. `list_init(&proc_list)`，并初始化 `HASH_LIST_SIZE` 个 PID 哈希桶；
+2. `alloc_proc()` 创建 `idleproc`：`pid = 0`、状态 `PROC_RUNNABLE`、`kstack = bootstack`、`need_resched = 1`，命名 `"idle"`，入进程链表和哈希表，`nr_process++`；
+3. `current = idleproc`；
+4. `kernel_thread(init_main, "Hello world!!", 0)` 创建 `initproc`；
+5. `find_proc(pid)` 取回 `initproc`，命名 `"init"`。
+
+`idleproc->need_resched = 1` 的作用：0 号进程进入 `cpu_idle` 循环后立即触发一次调度，把 CPU 让给刚创建的 `initproc`。
+
+##### （7）`cpu_idle()` 与 `proc_run()`
+
+`cpu_idle()` 是 0 号进程的主循环：没有其他事情可做时，只要 `current->need_resched` 为真就调用 `schedule()`：
+
+```c
+void cpu_idle(void)
+{
+    while (1)
+    {
+        if (current->need_resched)
+        {
+            schedule();
+        }
+    }
+}
+```
+
+`proc_run()` 在关中断的临界区内完成“改 `current`、切页表、切上下文”三步：
+
+```c
+void proc_run(struct proc_struct *proc)
+{
+    if (proc == current)
+    {
+        return;
+    }
+
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        struct proc_struct *prev = current;
+
+        current = proc;                                 // 更新当前进程
+        proc->runs++;                                   // 运行次数 +1
+
+        // 切换页表：satp = SV39 模式 | (页目录物理地址 >> 12)
+        // 与 pmm.c 建立内核页表时的写法保持一致
+        write_csr(satp, 0x8000000000000000ULL | ((uintptr_t)proc->pgdir >> RISCV_PGSHIFT));
+
+        // 保存 prev 的上下文到 prev->context，并从 proc->context 恢复
+        switch_to(&(prev->context), &(proc->context));
+    }
+    local_intr_restore(intr_flag);
+}
+```
+
+要点：
+
+- `proc == current` 时直接返回，避免自己切自己；
+- 临界区保证 `current`、`satp`、上下文三者一致，不会在切换中途被中断打断；
+- `satp` 写法与 `pmm.c` 建立内核页表时保持一致：模式位 `0x8000000000000000`（Sv39），页目录物理地址右移 `RISCV_PGSHIFT`；`proc_run()` 中不使用 `lsatp()`，因为现有 `libs/riscv.h` 中 `lsatp()` 的模式位对 64 位 Sv39 不正确；
+- `switch_to()` 只保存/恢复 callee-saved 寄存器（`ra`、`sp`、`s0~s11`），其实现见 4.3 节。
+
+新线程第一次被调度时的执行链：
 
 ```text
 switch_to
@@ -303,54 +515,55 @@ switch_to
   -> fn(arg)
 ```
 
-`do_fork()` 按以下顺序组合资源：
+`forkret` 由 `context.ra` 进入；`forkrets` 把新线程的 trapframe 作为栈指针；`__trapret` 恢复 CSR 和通用寄存器后执行 `sret`；最后 `kernel_thread_entry` 用 `s1` 作参数、`s0` 作函数地址调用 `fn`。
 
-```text
-alloc_proc
-  -> setup_kstack
-  -> copy_mm
-  -> copy_thread
-  -> get_pid
-  -> hash_proc
-  -> 挂入 proc_list
-  -> wakeup_proc
-```
-
-任何一步失败时都要按已获得资源逆序释放，避免 PCB 或内核栈泄漏。
-
-#### 4.2.3 Spec
+#### 4.2.4 Spec
 
 ```text
 Pre-Condition:
   current 指向当前执行线程；
   kernel_thread 提供合法的函数入口和参数；
-  alloc_pages、kmalloc 和进程链表初始化已完成。
+  alloc_pages、kmalloc 和进程链表初始化已完成；
+  proc_list 与 PID 哈希表尚未初始化。
 
 Post-Condition:
   idleproc 的 PID 为 0，状态为 PROC_RUNNABLE，kstack 为 bootstack；
-  initproc 的 PID 为 1，状态为 PROC_RUNNABLE；
+  current 指向 idleproc；
+  initproc 的 PID 为 1，状态为 PROC_RUNNABLE，parent 为 idleproc；
   initproc 已挂入 proc_list 和 PID 哈希表；
+  initproc 的 tf 位于自己的内核栈顶部；
   initproc 的 context.ra 指向 forkret；
-  initproc 的 context.sp 和 tf 指向其内核栈中的 Trap frame。
+  initproc 的 context.sp 与 tf 指向其内核栈中的 Trap frame；
+  kernel_thread 构造的 Trap frame 中 epc=kernel_thread_entry，s0=fn，s1=arg；
+  proc_run 切换后 current、satp 与恢复的上下文三者一致；
+  cpu_idle 在 need_resched 为 1 时调用 schedule()。
 
 Failure:
   PCB 或内核栈分配失败时返回负错误码；
-  失败路径必须释放已获得资源；
-  不允许把未初始化 PCB 或未挂接的线程设置为可运行。
+  失败路径必须按逆序释放已获得的内核栈与 PCB；
+  不能把 pid=-1、未挂接或无 Trap frame 的进程设置为可运行；
+  PID 分配、入链表和入哈希表必须在关中断的临界区内完成；
+  proc_run 不能在切换中途让 current 与 satp 不一致；
+  同一进程重复调用 proc_run 应直接返回。
 ```
 
-#### 4.2.4 使用的 Prompt
+#### 4.2.5 使用的 Prompt
 
 对应 `report/prompt.md` 中的 **P04：实现进程创建与初始化**。
 
-#### 4.2.5 验证状态
+#### 4.2.6 验证状态
+
+Process Create 测试由 `tools/inject.py` 注入到 `proc_init()` 末尾，发生在 `intr_enable()` 之前，因此不依赖调度器。测试断言包括：
+
+- `idleproc`：`current == idleproc`、`pid == 0`、`state == PROC_RUNNABLE`、`kstack == bootstack`、`parent == NULL`、`mm == NULL`、`tf == NULL`、`runs == 0`、`flags == 0`、`context.ra == 0`；
+- `initproc`：`pid == 1`、`state == PROC_RUNNABLE`、`parent == idleproc`、`mm == NULL`、`context.ra != 0`、`context.sp != 0`。
+
+通过输出：
 
 ```text
 [Test Process Create] PASS
 check Process Create: OK
 ```
-
-测试验证了 `idleproc`、`initproc`、PID、状态、父进程、内核栈、Trap frame 和上下文关键字段。
 
 ---
 
