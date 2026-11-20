@@ -7,12 +7,12 @@
 | 编号 | 负责人 | 功能模块 | 结果 |
 |------|--------|----------|------|
 | P01 | 刘国全 | Lab2 Best-Fit PMM 与 `page_init()` 迁移 | 编译及 PMM 检查通过 |
-| P02 | 王乐妍 | Lab3 Trap 恢复链迁移 | Trap、首次运行链正常 |
+| P02 | 王乐妍 | Lab3 Trap 恢复链迁移（复用 Lab3 提示词回填） | 已回填（d6af9fe），首次运行链联调通过 |
 | P03 | 刘国全 | `page_insert()`、`page_remove()` | `[Test PMM] PASS` |
 | P04 | 刘爽 | 进程创建与初始化 | `[Test Process Create] PASS` |
-| P05 | 王乐妍 | `schedule()`、`proc_run()`、`switch_to()` | 初版完成，Schedule 未通过 |
+| P05 | 王乐妍 | `switch_to()`、`schedule()` 初版（含 runs++ 职责修正） | 实现（c74d392），Schedule 测试未通过 |
 | P06 | 刘国全 | 修复调度链表回绕和 idleproc 选择问题 | `[Test Schedule] PASS`，30/30 |
-| P07 | 全员 | 测试、截图、报告与最终检查 | 报告及测试材料完成 |
+| P07 | 王乐妍 | 调度测试与 GDB 验证 | make grade 30/30，首次运行链路确认 |
 
 ---
 
@@ -88,65 +88,50 @@ alloc_pages 在 nr_free 不足时返回 NULL；
 
 **负责人：**2413423-王乐妍
 
-**使用目的：**恢复 Lab4 所需的 Lab3 Trap 处理能力，使 `forkret -> forkrets -> __trapret` 首次运行链可用。
+> 按练习要求，依赖迁移不重新设计提示词，复用 Lab3 已迭代定稿的提示词，将生成结果回填到 Lab4 框架标有 `lab3` 注释的位置。此处记录迁移用的汇总性提示词。
 
 ### Prompt
 
 ```text
 [PROMPT]
-根据 Lab3 的实现补齐 Lab4 的 kern/trap/trapentry.S 和 kern/trap/trap.c：
-实现 RESTORE_ALL、__alltraps、interrupt_handler() 和 exception_handler()。
-要求 Trap frame 为 32 个通用寄存器加 sstatus、sepc、sbadaddr、scause。
-__alltraps 保存现场后以 sp 作为 trap(struct trapframe *tf) 的参数。
-RESTORE_ALL 先恢复 CSR，再恢复 x1、x3~x31，最后恢复 sp。
-forkrets 必须能接收一个新进程的 Trap frame 并跳转到 __trapret。
+Lab4 框架中 kern/trap/trapentry.S 与 kern/trap/trap.c 已保留 Lab3 的框架代码并留有
+"#lab3:填写你在lab3中实现的代码" 与 "//lab3 请补充你在lab3中的代码" 标记。请将 Lab3
+分支中已通过全部测试的 Trap 实现原样回填到对应标记位置，包括：trapentry.S 的 RESTORE_ALL
+宏、__alltraps 入口、__trapret 恢复链；trap.c 的 interrupt_handler() 与
+exception_handler()。只做代码迁移，不重新设计，不修改任何函数签名与框架既有代码。
 
 [RELY]
-- Lab3 已验证的 trapentry.S 和 trap.c
-- struct trapframe 的 36 项布局
-- STORE/LOAD、REGBYTES、sret
-- IRQ_S_TIMER、IRQ_S_SOFT
-- CAUSE_ILLEGAL_INSTRUCTION、CAUSE_BREAKPOINT
-- tlb_invalidate、clock_set_next_event
-- forkrets、__trapret、forkret
+Lab3 分支已验证的 trapentry.S / trap.c 实现；Lab4 框架保留的 SAVE_ALL 宏、trap() 分发
+框架、print_trapframe() / print_regs()；clock.h 的 ticks 与 clock_set_next_event()；
+riscv.h 的 SSTATUS_SIE、IRQ_S_TIMER、CAUSE_ILLEGAL_INSTRUCTION、CAUSE_BREAKPOINT 宏；
+mmu.h / trap.h 中 trapframe 的槽位布局。
 
 [GUARANTEE]
-补充：
-- RESTORE_ALL 宏
-- __alltraps 入口
-- forkrets 所需的 __trapret 恢复链
-- interrupt_handler()
-- exception_handler()
-- trap_insn_len()
+必须实现的接口：
+RESTORE_ALL   宏：与 SAVE_ALL 对称的恢复序列
+__alltraps:   SAVE_ALL + trap() 分发 + __trapret
+__trapret:    RESTORE_ALL + sret
+forkrets:     move sp, a0 后跳入 __trapret（框架已有，不可改动）
+void interrupt_handler(struct trapframe *tf);
+void exception_handler(struct trapframe *tf);
+不得改动 idt_init()、trap() 及其他既有代码。
 
 [SPECIFICATION]
 Pre-Condition：
-Trap 发生时硬件已写入 sepc、scause、sstatus；
-sp 指向有效的内核栈；
-sscratch 中保存进入 Trap 前的 sp。
+idt_init() 已将 stvec 指向 __alltraps，sscratch 置 0 表示来自内核态。
 
 Post-Condition：
-Trap frame 完整保存 32 个通用寄存器和 4 个 CSR；
-trap() 能根据 scause 最高位分发给中断或异常处理；
-时钟中断每次重新设置下一次 timer；
-非法指令和断点异常按真实指令长度推进 epc；
-RESTORE_ALL 正确恢复 CSR 和通用寄存器，最后恢复 sp；
-__trapret 能通过 sret 返回；
-forkrets 能从一个新进程的 Trap frame 恢复首次运行现场。
+时钟中断可周期性到达并被处理，clock_set_next_event() 被重新调用；
+forkrets 能以传入 trapframe 为栈经 __trapret 完成恢复并 sret；
+非法指令与断点异常按指令真实长度（RVC 2 字节 / 普通 4 字节）前进 tf->epc。
 
 Failure：
-sp 不能提前恢复；
-CSR 恢复必须在覆盖 s0~s4 前完成；
-异常处理不能对压缩指令固定加 4；
-forkret/forkrets 链中的栈和寄存器不能错位。
+未知 cause 一律 print_trapframe() 兜底，不 panic、不推进 epc。
 ```
 
 ### 结果
 
-- Lab3 Trap 代码成功迁移到 Lab4。
-- 时钟中断持续触发。
-- `forkret -> forkrets -> __trapret -> kernel_thread_entry` 链路正常。
-- Schedule 测试最终能进入 `init_main`。
+已回填并提交（d6af9fe）。联调验证：时钟中断持续触发，`forkret -> forkrets -> __trapret -> kernel_thread_entry` 首次运行链正常，Schedule 测试最终能进入 `init_main`。
 
 ---
 
@@ -304,60 +289,175 @@ proc_run 不能在切换中途让 current 与 satp 不一致；
 
 **负责人：**2413423-王乐妍
 
-**使用目的：**实现 `cpu_idle()`、`schedule()`、`proc_run()` 和 `switch_to()`，让已创建的线程真正运行。
+**使用目的：**实现 `switch_to()` 与 `schedule()`，让已创建的线程真正运行。分两步：先以完整文件覆盖式提示词生成 `switch_to`（P05-a），再以标记插入式提示词生成 `schedule()`（P05-b）。
 
 ### Prompt
 
+#### P05-a：switch_to（完整文件覆盖式提示词）
+
 ```text
 [PROMPT]
-实现 Lab4 的进程调度模块：
-- cpu_idle() 持续检查 current->need_resched 并在需要时调用 schedule()；
-- schedule() 从 proc_list 中选择下一个 PROC_RUNNABLE 线程，找不到时回退 idleproc；
-- proc_run() 在临界区内更新 current、切换 satp 并调用 switch_to()；
-- switch_to() 只保存和恢复 callee-saved 寄存器。
+**任务**：编写文件 code/kern/process/switch.S，实现 RISC-V 汇编函数
+switch_to(struct context *from, struct context *to)，完成内核线程间的上下文保存与恢复。
+当前文件只有一行 "//LAB4 function3 YOUR CODE" 标记，请以完整文件内容覆盖。
+
+**操作要求**：你必须在项目中修改实际文件，而不是仅展示代码。只定义 switch_to 一个符号，
+不得修改工程中任何其他文件。
+
+**输出要求**：直接进行文件操作。使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 部分的
+信息，以工程真实代码为准，不要引入无关功能。
 
 [RELY]
-- struct proc_struct、struct context
-- proc_list、current、idleproc
-- PROC_RUNNABLE
-- need_resched、runs
-- local_intr_save/local_intr_restore
-- satp、RISCV_PGSHIFT
-- forkret、forkrets、__trapret
-- struct context 包含 ra、sp、s0~s11
+// struct context（kern/process/proc.h）
+struct context
+{
+    uintptr_t ra;
+    uintptr_t sp;
+    uintptr_t s0;
+    uintptr_t s1;
+    uintptr_t s2;
+    uintptr_t s3;
+    uintptr_t s4;
+    uintptr_t s5;
+    uintptr_t s6;
+    uintptr_t s7;
+    uintptr_t s8;
+    uintptr_t s9;
+    uintptr_t s10;
+    uintptr_t s11;
+};
+
+// 函数原型（kern/process/proc.h）
+void switch_to(struct context *from, struct context *to);
+
+// 调用点（kern/process/proc.c 的 proc_run()）
+switch_to(&prev->context, &next->context);
 
 [GUARANTEE]
-派生：
-- void cpu_idle(void)
-- void schedule(void)
-- void proc_run(struct proc_struct *proc)
-- void switch_to(struct context *from, struct context *to)
+必须实现的主要接口：
+.globl switch_to
+switch_to:  # void switch_to(struct context *from, struct context *to);
+你可以根据需要添加：
+- 汇编注释与偏移量定义（REGBYTES = 8）。
 
 [SPECIFICATION]
-Pre-Condition：
-proc_list 已完成初始化；
-idleproc、current 和 initproc 均已存在；
-调度只在关闭中断的临界区中修改共享状态。
+## switch_to
+Pre-Condition:
+- a0 = from，a1 = to，各指向一个合法的 struct context；
+- to 指向的 context 中，ra 与 sp 已被初始化：要么是目标线程上次被切出时保存的现场，
+  要么是首次运行前设置的入口（ra 指向 forkret，sp 指向其内核栈）。
 
-Post-Condition：
-cpu_idle 在 need_resched 为 1 时调用 schedule；
-schedule 选择一个非 idle 的 PROC_RUNNABLE 线程；
-如果只有 idleproc 可运行，则回退到 idleproc；
-proc_run 更新 current 和 runs，切换 satp，并调用 switch_to；
-switch_to 保存 from 的 ra/sp/s0~s11，恢复 to 的 ra/sp/s0~s11；
-新线程首次恢复时从 forkret 进入首次运行链。
+Post-Condition:
+- from 所指内存中已保存切换时刻的 ra、sp、s0~s11 共 14 个寄存器值，与 struct context
+  字段一一对应；
+- CPU 的 ra、sp、s0~s11 已被 to 所指内存中的值替换；
+- 函数通过 ret 返回，返回地址为 to->ra；
+- sp 在所有访存完成后最后恢复；不修改其余通用寄存器，不访问全局变量，不关开中断
+  （由调用方 proc_run()/schedule() 负责）。
 
-Failure：
-不能无条件重新开启中断；
-不能在切换过程中让 current、satp 和实际执行的上下文不一致；
-switch_to 不能破坏 caller-saved 寄存器；
-不能在链表遍历时遗漏可运行线程。
+Requirements:
+- 工程经 riscv64 交叉工具链汇编，不得使用未知伪指令或非 RISC-V 指令；
+- 保存与恢复的寄存器集合、顺序必须与 struct context 字段一一对应，禁止遗漏 s0~s11
+  中任何一个。
+```
+
+#### P05-b：schedule（标记插入式提示词，含迭代修正）
+
+```text
+[PROMPT]
+**任务**：修改文件 code/kern/schedule/sched.c，在 "//LAB4 function3 YOUR CODE" 标记处
+实现调度函数 schedule()：清除当前线程的 need_resched，从 proc_list 中选出下一个 state
+为 PROC_RUNNABLE 的线程，必要时通过 proc_run() 完成切换。保留文件中所有现有代码，只在
+标记位置插入新实现，不得修改任何既有函数的函数体或签名。
+
+**操作要求**：你必须在项目中修改实际文件，而不是仅展示代码。若需辅助函数必须声明为 static。
+
+**输出要求**：直接进行文件操作。使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 部分的
+信息，以工程真实代码为准，不要引入无关功能。
+
+[RELY]
+// 进程状态与进程控制块（kern/process/proc.h）
+enum proc_state
+{
+    PROC_UNINIT = 0, // uninitialized
+    PROC_SLEEPING,   // sleeping
+    PROC_RUNNABLE,   // runnable(maybe running)
+    PROC_ZOMBIE,     // almost dead, and wait parent proc to reclaim his resource
+};
+
+struct proc_struct
+{
+    enum proc_state state;        // Process state
+    int pid;                      // Process ID
+    int runs;                     // the running times of Proces
+    uintptr_t kstack;             // Process kernel stack
+    volatile bool need_resched;   // bool value: need to be rescheduled to release CPU?
+    struct proc_struct *parent;   // the parent process
+    struct mm_struct *mm;         // Process's memory management field
+    struct context context;       // Switch here to run process
+    struct trapframe *tf;         // Trap frame for current interrupt
+    uintptr_t pgdir;              // the base addr of Page Directroy Table(PDT)
+    uint32_t flags;               // Process flag
+    char name[PROC_NAME_LEN + 1]; // Process name
+    list_entry_t list_link;       // Process link list
+    list_entry_t hash_link;       // PID hash list
+};
+
+#define le2proc(le, member) \
+    to_struct((le), struct proc_struct, member)
+
+extern list_entry_t proc_list;
+extern struct proc_struct *idleproc, *initproc, *current;
+
+// 切换接口（kern/process/proc.h）
+void proc_run(struct proc_struct *proc);
+
+// 链表操作（libs/list.h）
+list_entry_t *list_next(list_entry_t *le);
+
+// 临界区保护（kern/sync/sync.h，sched.c 已 #include <sync.h>）
+#define local_intr_save(x) \
+    do {                   \
+        x = __intr_save(); \
+    } while (0)
+#define local_intr_restore(x) __intr_restore(x);
+
+// 既有声明（kern/schedule/sched.h）
+void schedule(void);
+
+[GUARANTEE]
+必须实现的主要接口：
+void schedule(void);
+你可以根据需要添加：
+- static 辅助函数或宏（如有必要）。
+
+[SPECIFICATION]
+## schedule
+Pre-Condition:
+- current 指向当前正在运行的线程，不为 NULL；
+- proc_list 中至少存在一个 state 为 PROC_RUNNABLE 的线程，或可回退到 idleproc。
+
+Post-Condition:
+- current->need_resched 已被清 0；
+- next 的选取规则：current != idleproc 时，从 current->list_link 的下一个链表项开始
+  循环查找第一个 state == PROC_RUNNABLE 的线程；current == idleproc 时，从 proc_list
+  链表头开始查找；整个链表查完无可运行线程时，next = idleproc；
+- next != current 时已调用 proc_run(next)；next == current 时不调用 proc_run，直接返回；
+- 选取与切换过程处于 local_intr_save/local_intr_restore 之间，返回前中断状态已恢复；
+- proc->runs++ 属于 proc_run() 的职责（分工 B5 第 4 步），schedule() 不得重复计数。
+
+Failure:
+- proc_list 为空或全部线程不可运行时，不得 panic、不得解引用 NULL，必须回退到
+  next = idleproc。
+
+Requirements:
+- 不得修改 wakeup_proc() 及文件中其他既有代码；不得改动 proc.h/sched.h/sync.h 等头文件；
+- 工程以 GNU C99 且 -Wall -Werror 编译，不得引入隐式声明等告警。
 ```
 
 ### 结果
 
-- `switch_to()` 编译并完成上下文切换。
-- 初版 `schedule()` 能编译并进入调度，但 Schedule 测试仍失败。
+一次迭代后实现完成（提交 c74d392）。迭代原因见报告 4.3.3 第一次迭代：首次生成中 AI 在 `schedule()` 内自行加了 `next->runs++`，与 `proc_run()` 的职责重复会导致 `runs` 每次调度 +2；修正方式为在 `[SPECIFICATION]` 中显式声明 `runs++` 归 `proc_run()`，删除该行后重新生成。`switch_to()` 编译并完成上下文切换；初版 `schedule()` 能编译并进入调度，但 Schedule 测试仍未通过（环形回绕问题，由 P06 修复）。
 
 ---
 
@@ -422,60 +522,46 @@ Total Score: 30/30
 
 ---
 
-## P07：测试、截图与报告整理
+## P07：调度测试与 GDB 验证
 
-**负责人：**全员，王乐妍统稿
+**负责人：**2413423-王乐妍
 
-**使用目的：**将实现、测试、Bug 记录和 Prompt 整理成可提交的 Markdown 报告。
+**使用目的：**proc.c 集成后验证调度模块并输出验证证据（make grade 结果 + GDB 首次运行链观察）。
 
 ### Prompt
 
 ```text
 [PROMPT]
-根据 Lab4 的实际源码、Git 提交记录和 make grade 输出，完成实验报告、
-Prompt 汇总和测试截图。不得虚构测试结果；报告中的分工、函数名、
-代码路径和得分必须与当前工程一致。最终报告以文本说明为主。
+proc.c 集成完成后，协助验证调度模块并输出验证证据：
+1) 运行 make grade，确认输出 [Test Schedule] PASS，以及
+   "this initproc, pid = 1, name = \"init\""、
+   "To U: \"Hello world!!\"."、
+   "To U: \"en.., Bye, Bye. :)\"" 等预期输出；
+2) 给出用 GDB 验证上下文切换的操作步骤：在 switch_to 处设置断点，检查 a0/a1 指向的
+   struct context 内容，单步观察 ra/sp/s0~s11 的保存与恢复，确认首次运行的线程经
+   to->ra 进入 forkret，再经 forkrets -> __trapret 落到 kernel_thread_entry。
 
 [RELY]
-- code/kern/mm/pmm.c
-- code/kern/mm/default_pmm.c
-- code/kern/process/proc.c
-- code/kern/process/switch.S
-- code/kern/schedule/sched.c
-- code/kern/trap/trap.c
-- code/kern/trap/trapentry.S
-- report/images/01_pmm.png
-- report/images/02_process_create.png
-- report/images/03_schedule.png
-- make grade 输出：Total Score: 30/30
+tools/test_lab4.c 的 test_lab4_schedule()（由 tools/inject.py 注入）；
+kern/process/switch.S 的 switch_to；kern/process/proc.c 的 forkret/forkrets；
+tools/gdbinit 与 make debug/make gdb 调试入口。
 
 [GUARANTEE]
-- report/report.md
-- report/prompt.md
-- report/images/01_pmm.png
-- report/images/02_process_create.png
-- report/images/03_schedule.png
+只做验证与调试观察，不修改任何内核源码。
 
 [SPECIFICATION]
 Pre-Condition：
-Lab4 代码已合并；
-make grade 已得到 30/30；
-三张测试截图已存在。
+proc.c 集成完成，make 可生成 bin/kernel。
 
 Post-Condition：
-报告包含实验整体逻辑、每个核心模块、Spec、Prompt、AI Bug、测试结果、
-OS 知识点和未覆盖知识点；
-Prompt 汇总为四段式；
-所有测试截图路径有效；
-报告中不出现模板占位文本；
-报告中的数字、函数名和提交结果与实际情况一致。
+make grade 输出 [Test Schedule] PASS；GDB 断点处能观察到 switch_to 前后 sp/ra 的
+保存与恢复、以及新线程首次进入 forkret 的完整链路。
 
 Failure：
-不得把其他成员的代码归属写错；
-不得声称未验证的功能通过；
-不得修改评分脚本或测试代码来制造通过结果。
+若测试失败，定位并报告首个断言失败的检查点（需指出对应源码位置与现场寄存器值），
+不猜测性修改代码。
 ```
 
 ### 结果
 
-报告、Prompt 和测试截图已整理完成，最终测试为 30/30。
+`make grade` 通过：PMM、Process Create、Schedule 检查全部 OK，Total Score 30/30；initproc 预期输出确认（见报告 4.3.6 与 5.3 节截图）。首次运行链路经 GDB 断点逐步观察确认（记录见报告 7.3 节 Bug 4）。

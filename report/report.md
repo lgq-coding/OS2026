@@ -569,64 +569,119 @@ check Process Create: OK
 
 ### 4.3 功能模块：进程调度与上下文切换
 
-**负责人：**2413423-王乐妍；刘国全协助修复调度链表回绕问题
+**负责人：**2413423-王乐妍（`schedule()` 初版与 `switch_to()` 实现）；刘国全协助完成调度链表回绕修复
 
 **涉及文件：**
 
-- `code/kern/process/proc.c`
 - `code/kern/schedule/sched.c`
 - `code/kern/process/switch.S`
+- `code/kern/process/proc.c`（`cpu_idle()`、`proc_run()` 由刘爽负责，实现见 4.2 节）
 
 #### 4.3.1 功能说明
 
-`cpu_idle()` 是空闲线程主体，持续检查 `current->need_resched`。
+调度模块负责把已经创建出来的内核线程真正交给 CPU 执行，覆盖 `cpu_idle -> schedule -> proc_run -> switch_to` 完整链路。各层职责严格分层：
 
-`schedule()` 负责从进程链表中寻找下一个 `PROC_RUNNABLE` 线程。
+- `schedule()` 负责"选谁"：从 `proc_list` 中选出下一个 `PROC_RUNNABLE` 的线程；
+- `proc_run()` 负责"怎么切过去"：关中断、更新 `current`、切换页表（写 `satp`）、调用 `switch_to()`（实现见 4.2 节）；
+- `switch_to()` 负责"最底层的寄存器现场保存与恢复"，只做上下文搬运，不参与任何策略判断；
+- `cpu_idle()` 是 idle 线程的执行主体，检测到 `need_resched` 时调用 `schedule()`。
 
-`proc_run()` 负责更新 `current`、切换页表并调用 `switch_to()`。
-`switch_to()` 只负责保存和恢复 callee-saved 寄存器。
+新线程第一次运行之所以能走到正确入口，是因为 4.2 节已经把它的 `context.ra` 和 trapframe 预先组织成了 `forkret -> forkrets -> __trapret` 恢复链路（Trap 侧实现见 4.4.2 节）。
 
 #### 4.3.2 核心实现
 
-`switch_to()` 只保存 `ra`、`sp` 和 `s0~s11`：
+##### switch_to()（kern/process/switch.S）
 
 ```asm
-sd ra, 0*REGBYTES(a0)
-sd sp, 1*REGBYTES(a0)
-sd s0, 2*REGBYTES(a0)
-...
-ld ra, 0*REGBYTES(a1)
-ld s0, 2*REGBYTES(a1)
-...
-ld sp, 1*REGBYTES(a1)
-ret
+switch_to:
+    # a0 = from, a1 = to（RISC-V 调用约定）
+    sd  ra, 0*REGBYTES(a0)     # 保存当前现场到 *from
+    sd  sp, 1*REGBYTES(a0)
+    sd  s0~s11, 2~13*REGBYTES(a0)
+    ld  ra, 0*REGBYTES(a1)     # 从 *to 恢复目标现场
+    ld  s0~s11, 2~13*REGBYTES(a1)
+    ld  sp, 1*REGBYTES(a1)     # sp 最后恢复
+    ret                        # 返回地址即 to->ra
 ```
 
-原因是指针和临时寄存器属于 caller-saved，编译器会在普通函数调用中负责保存；`s0~s11` 属于 callee-saved，必须由上下文切换代码保存。
+实现要点：
 
-`proc_run()` 在关中断的临界区中完成：
+1. **只保存 callee-saved 寄存器**：`ra`、`sp`、`s0~s11` 共 14 个，与 `struct context` 字段一一对应（`REGBYTES = 8`）。不保存 caller-saved 寄存器（`t0~t6`、`a0~a7`）——按 RISC-V 调用约定，普通函数调用边界上 C 编译器已经负责保存这些寄存器，`switch_to` 对 C 调用方而言就是一个普通函数。
+2. **sp 必须最后恢复**：恢复过程中对 `*from` / `*to` 的所有访存都依赖 a0/a1 与当前 sp 寻址，一旦 sp 被替换，旧指针即失效。
+3. **`ret` 的返回地址是刚载入的 `to->ra`**：线程被切回时从上次切出点继续执行；线程首次运行时 `ra` 指向 `forkret`（由 `copy_thread()` 预先设置），由此进入首次运行恢复链。
+4. `switch_to` 不选择线程、不修改 `current`、不关开中断——这些由 `schedule()` 和 `proc_run()` 完成。
 
-```c
-current = proc;
-proc->runs++;
-write_csr(satp, 0x8000000000000000ULL |
-         ((uintptr_t)proc->pgdir >> RISCV_PGSHIFT));
-switch_to(&prev->context, &proc->context);
+##### schedule()（kern/schedule/sched.c）
+
+`schedule()` 的最终逻辑描述如下（完整代码见 `code/kern/schedule/sched.c`）：
+
+1. 进入 `local_intr_save` 临界区后清除 `current->need_resched`，避免同一次调度请求被重复处理；
+2. **起点规则**：`current != idleproc` 时从 `current->list_link` 的下一个链表项开始查找，`current == idleproc` 时从 `proc_list` 链表头开始；
+3. **环形回绕**：起点恰好是链表头（即 current 是最后一个节点）时改从第一个节点开始；扫描过程中遇到链表头也绕回继续，直到回到起点，形成完整的环形遍历，保证任何位置的可运行线程都不会被跳过；
+4. **选择条件**：`p != idleproc && p != current && p->state == PROC_RUNNABLE`——idleproc 只作为兜底，不允许它抢占真正的可运行线程，也不能重复选中当前线程；
+5. **兜底规则**：整个环形遍历没有找到可运行线程时 `next` 保持 `idleproc`，不 panic、不解引用 NULL；
+6. `next == current`（链表上只有当前线程可运行）时直接返回，避免无意义的自切换；
+7. 找到目标后调用 `proc_run(next)`，选取与切换全程处于 `local_intr_save/restore` 临界区内（机制详见 Challenge 6.1）。
+
+#### 4.3.3 实现迭代过程
+
+本模块经历 2 次迭代：
+
+##### 第一次迭代：schedule() 内重复计数 runs（跨模块职责冲突）
+
+**遇到的问题：**AI 首次生成的 `schedule()` 在调用 `proc_run()` 之前自行执行了 `next->runs++`。单独审查 `schedule()` 的局部逻辑（起点规则、回退 idleproc、临界区保护、`next == current` 直接返回）全部正确，但对照分工文档发现 `proc->runs++` 已明确划给 `proc_run()`（分工 B5 第 4 步）。两处同时存在会使每次调度 `runs` 被加 2，若测试检查 `runs` 值将直接出错。
+
+**问题解决策略：**在提示词的 `[SPECIFICATION]` 中显式声明"`runs++` 属于 `proc_run()` 的职责，`schedule()` 不得重复计数"，删除该行后重新生成提交（c74d392）。这是一次典型的**跨模块职责边界类 AI Bug**：单函数视角下完全正确的代码，只有对照模块间接口约定才能发现冲突。
+
+##### 第二次迭代：调度链表不回绕、idleproc 被提前选中（负责人：刘国全）
+
+**遇到的问题：**初版 `schedule()` 从当前线程的下一个节点开始查找，但扫描到链表尾后没有回到链表头——当 current 是链表最后一个节点时，起点直接落到链表头，循环一次都不执行，测试线程永远选不上；同时选择条件只判断 `PROC_RUNNABLE`，而 idleproc 本身在 `proc_list` 中且状态为 `PROC_RUNNABLE`，会被当成"真实可运行线程"提前选中。表现为 Schedule 测试失败，QEMU 只重复输出 `100 ticks`。
+
+**问题解决策略：**将查找循环改为 `do { ... } while (le != start)` 的环形遍历，起点为链表头时绕回第一个节点；选择条件增加 `p != idleproc && p != current`；`need_resched` 清零移入临界区。修复集中在 `schedule()` 内部，未修改测试和评分脚本。
+
+#### 4.3.4 Spec
+
+```text
+## switch_to
+Pre-Condition:
+- a0 = from，a1 = to，各指向一个合法的 struct context；
+- to 指向的 context 中 ra 与 sp 已初始化：要么是目标线程上次被切出时保存的现场，
+  要么是首次运行前设置的入口（ra 指向 forkret，sp 指向其内核栈）。
+
+Post-Condition:
+- from 所指内存已保存切换时刻的 ra、sp、s0~s11 共 14 个寄存器值，与 struct context 一一对应；
+- CPU 的 ra、sp、s0~s11 已被 to 所指内存中的值替换；
+- 通过 ret 返回，返回地址为 to->ra；
+- 不修改其余通用寄存器，不访问全局变量，不关开中断（由调用方负责）。
+
+Failure:
+- 无（纯寄存器搬运，无失败路径）。
+
+## schedule
+Pre-Condition:
+- current 指向当前正在运行的线程，不为 NULL；
+- proc_list 中至少存在一个 PROC_RUNNABLE 的线程，或可回退到 idleproc。
+
+Post-Condition:
+- 在临界区内清除 current->need_resched；
+- next 选取：从 current（current 为 idleproc 时从链表头）的下一项开始环形遍历，
+  找第一个非 idle、非 current 且 PROC_RUNNABLE 的线程；查完一整圈无可运行线程时
+  next = idleproc；
+- next != current 时已调用 proc_run(next)；next == current 时直接返回；
+- 选取与切换处于 local_intr_save/restore 之间，返回前中断状态已恢复；
+- runs++ 由 proc_run() 负责，schedule() 不重复计数。
+
+Failure:
+- proc_list 为空或全部线程不可运行时，不 panic、不解引用 NULL，回退到 next = idleproc。
 ```
 
-#### 4.3.3 调度问题与修复
+#### 4.3.5 使用的 Prompt
 
-初版 `schedule()` 从当前线程的下一个节点开始查找，但扫描到链表尾后没有回到链表头；同时把 `idleproc` 当成普通可运行线程，导致测试线程尚未运行时系统就切回 idleproc。
+- **P05：实现调度与上下文切换**（初版，含 runs++ 职责修正）
+- **P06：修复调度链表回绕与 idleproc 选择问题**（第二次迭代）
+- **P07：调度测试与 GDB 验证**
 
-修复后的逻辑：
-
-1. 当前线程不是 idleproc 时，从它的下一个节点开始。
-2. 如果当前线程是链表最后一个节点，则从链表第一个节点开始。
-3. 扫描到链表头后回绕继续查找，形成完整的环形遍历。
-4. 正常调度时跳过 `idleproc` 和当前线程。
-5. 只有找不到其他可运行线程时，才回退到 `idleproc`。
-
-修复后 `[Test Schedule] PASS`，并输出：
+#### 4.3.6 验证状态
 
 ```text
 this initproc, pid = 1, name = "init"
@@ -634,38 +689,7 @@ To U: "Hello world!!".
 To U: "en.., Bye, Bye. :)"
 ```
 
-#### 4.3.4 Spec
-
-```text
-Pre-Condition:
-  proc_list 已完成初始化；
-  current 指向当前运行线程；
-  idleproc 已存在。
-
-Post-Condition:
-  schedule 选择一个 PROC_RUNNABLE 的非 idle 线程；
-  若没有其他可运行线程，则选择 idleproc；
-  选中的线程通过 proc_run 和 switch_to 获得 CPU；
-  current、satp 和上下文保持一致。
-
-Failure:
-  不能在关闭中断后遗漏恢复中断状态；
-  不能重复选择当前线程；
-  不能因为链表遍历不回绕而永久跳过可运行线程。
-```
-
-#### 4.3.5 使用的 Prompt
-
-- **P05：实现调度与上下文切换**
-- **P06：修复调度链表回绕问题**
-
-#### 4.3.6 验证状态
-
-```text
-[Test Schedule] PASS
-check Schedule: OK
-Total Score: 30/30
-```
+Schedule 相关检查通过，`make grade` 最终结果 30/30（截图见 5.3 节 `04_make_grade_result.png`）。
 
 ---
 
@@ -695,14 +719,66 @@ const struct pmm_manager default_pmm_manager = {
 
 **负责人：**2413423-王乐妍
 
-需要恢复：
+**涉及文件：**
 
-- `RESTORE_ALL`
-- `__alltraps`
-- `interrupt_handler()`
-- `exception_handler()`
+- `code/kern/trap/trapentry.S`
+- `code/kern/trap/trap.c`
 
-`forkret -> forkrets -> __trapret` 的首次运行链依赖 Lab3 的上下文恢复代码。特别地，`forkrets` 会把新线程的 Trap frame 作为栈指针，随后 `__trapret` 恢复 CSR 和通用寄存器并执行 `sret`。
+Lab4 的进程首次运行与调度触发都建立在 Lab3 的 Trap 框架之上：
+
+1. `kernel_thread()` 构造的临时 trapframe，要经过 `forkrets -> __trapret -> sret` 才能落到 `kernel_thread_entry` 开始执行——没有这条恢复链，新线程永远无法"第一次跑起来"；
+2. 时钟中断链路必须完好，调度器才有可靠的周期性触发源。
+
+按练习要求，本模块不重新设计提示词，而是把 Lab3 已实现并通过测试的代码回填到 Lab4 框架中标有 `lab3` 注释的位置（迁移用提示词见 `prompt.md` P02）。代码沿用 Lab3 各成员的实现（trapentry.S 汇编部分在 Lab3 由刘国全完成、`interrupt_handler()` 由刘爽完成、`exception_handler()` 由王乐妍完成），Lab4 中的统一回填与验证由王乐妍负责。
+
+##### SAVE_ALL / RESTORE_ALL 宏（trapentry.S）
+
+- **SAVE_ALL（框架已有）**：先把中断前的 sp 存入 `sscratch`，腾出 `36 * REGBYTES` 的 trapframe；保存 `x1`、`x3~x31`（`x0` 恒为 0 不存，槽 2 留给原 sp）；再用 `s0~s4` 作中转，把 `sscratch`（原 sp）、`sstatus`、`sepc`、`sbadaddr`（CSR 0x143）、`scause` 五个特殊值写入帧内固定槽位（槽 2、32~35）。
+- **RESTORE_ALL（本次回填）**：顺序与 SAVE_ALL 相反——先恢复 CSR（`sscratch/sstatus/sepc/sbadaddr/scause`），再恢复通用寄存器，sp（x2）最后恢复。**必须先 CSR 后 GPR**：恢复通用寄存器要用 `s0~s4` 做中转，若先恢复它们会破坏中转值；**sp 必须最后恢复**：帧内所有槽位都通过它寻址。
+
+##### __alltraps / __trapret / forkrets
+
+```asm
+__alltraps:
+    SAVE_ALL
+    mv  a0, sp        # trapframe 指针作为参数
+    jal trap
+    j   __trapret
+__trapret:
+    RESTORE_ALL
+    sret
+forkrets:
+    move sp, a0       # 栈切到新进程内核栈顶部的 trapframe
+    j   __trapret
+```
+
+`forkrets` 把栈切换到新进程的 trapframe 后跳入 `__trapret`，这正是新线程第一次运行链 `forkret -> forkrets -> __trapret -> kernel_thread_entry` 的后半段——`sret` 时 `sepc` 已被 `kernel_thread()` 设为 `kernel_thread_entry`，于是新线程从自己的入口函数开始执行。
+
+##### interrupt_handler()（trap.c）
+
+- `IRQ_S_TIMER`：`ticks++`；每 `TICK_NUM`（=100）次打印一行统计；调用 `clock_set_next_event()` **重新武装下一次时钟中断**——若遗漏此步，只会收到一次中断，调度将失去周期性触发源；
+- `IRQ_S_SOFT`：打印提示；
+- 未知中断：打印 trapframe 兜底。
+
+##### exception_handler()（trap.c）
+
+- 非法指令与断点异常：打印提示，并用 `trap_insn_len()` 依据指令编码低两位判断真实长度（低两位为 0x3 → 32 位指令 4 字节；否则为 RVC 压缩指令 2 字节）前进 `tf->epc`，保证 `sret` 返回后不会重复执行同一条故障指令；
+- 其余异常：`print_trapframe()` 兜底，不改变执行位置。
+
+##### Spec
+
+```text
+Pre-Condition:
+- idt_init() 已将 stvec 指向 __alltraps，sscratch 置 0（表示来自内核态）。
+
+Post-Condition:
+- 内核能正常接收时钟中断，且每次处理后下一次中断已被重新武装；
+- forkrets 能以新进程 trapframe 为栈完成恢复，__trapret 正确执行 sret；
+- 异常处理只前进 epc、不破坏已保存上下文。
+
+Failure:
+- 未知 cause 一律走 print_trapframe() 兜底，不 panic。
+```
 
 #### 4.4.3 验证状态
 
@@ -764,14 +840,43 @@ Total Score: 30/30
 
 ### 6.1 `local_intr_save/restore` 如何实现开关中断
 
-`__intr_save()` 读取 `sstatus.SIE`：
+**负责人：**2413423-王乐妍
 
-- 如果原来开启中断，则调用 `intr_disable()` 关闭中断并返回 1；
-- 如果原来已经关闭中断，则返回 0，不改变状态。
+#### 1. 开关中断的实现机制
 
-`__intr_restore(flag)` 只有在 `flag == 1` 时才重新开启中断。这样能保证临界区退出后恢复的是进入前的状态，而不是无条件开启中断。
+```c
+// kern/sync/sync.h
+static inline bool __intr_save(void) {
+    if (read_csr(sstatus) & SSTATUS_SIE) {
+        intr_disable();          // clear_csr(sstatus, SSTATUS_SIE)
+        return 1;
+    }
+    return 0;
+}
+static inline void __intr_restore(bool flag) {
+    if (flag) {
+        intr_enable();           // set_csr(sstatus, SSTATUS_SIE)
+    }
+}
+#define local_intr_save(x)    do { x = __intr_save(); } while (0)
+#define local_intr_restore(x) __intr_restore(x);
+```
 
-`do { } while (0)` 让多语句宏在语法上表现得像一条普通语句，避免破坏 `if/else` 结构。
+`local_intr_save(x)` 读取 `sstatus` 的 `SIE` 位并保存"快照"到 `x`：中断原本开启，则用 `clear_csr` 关闭中断并记 `x = 1`；原本就是关闭的，则只记 `x = 0`，完全不碰硬件。`local_intr_restore(x)` 按快照恢复：`x = 1` 才用 `set_csr` 重新开中断，`x = 0` 时什么都不做。
+
+所以这对宏的本质**不是"关中断/开中断"，而是"保存中断状态快照 + 关中断 / 按快照恢复"**，保证临界区结束后中断状态与进入前完全一致。
+
+#### 2. `do { } while (0)` 的作用
+
+- 把多条语句包装成一个语法上的"单语句"，使宏在**未加花括号的 if/else 分支**中展开也安全；否则展开出的多条语句会让 `else` 悬挂到错误位置，导致编译错误或逻辑错误。
+- `while (0)` 的循环体只执行一次，不产生任何运行时开销，编译器会直接优化掉。
+- 让宏调用处能像函数调用一样以分号结尾（`local_intr_save(flag);`），避免展开后多余或缺失分号带来的语法问题。
+
+#### 3. 为什么不能无条件 `intr_enable()`
+
+- **临界区可能嵌套**：外层已关中断时进入内层临界区，`__intr_save` 记录 `x = 0`；若内层退出时无条件开中断，外层临界区剩余执行期间就暴露在中断之下，互斥保护被破坏。
+- **上下文可能本来就关中断**：比如异常处理早期中断尚未开启，退出临界区时不应擅自改变全局中断状态。
+- 因此正确的语义是"**恢复到进入前的状态**"而不是"打开中断"——这正是 `__intr_save()` 返回值存在的意义。
 
 ### 6.2 `sv32`、`sv39`、`sv48` 的异同
 
