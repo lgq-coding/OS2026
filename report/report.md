@@ -94,7 +94,7 @@ kern_init
 ### 3.2 功能的逐步实现
 
 1. **迁移 Lab2/Lab3 依赖。**
-   - 在 `default_pmm.c` 中恢复 Best-Fit 管理器。
+   - 在 `best_fit_pmm.c` 中恢复 Best-Fit 管理器。
    - 在 `pmm.c` 中实现 `page_init()`。
    - 在 `trap.c` 和 `trapentry.S` 中恢复中断、异常和 Trap 返回链。
 2. **实现页表映射维护。**
@@ -127,7 +127,7 @@ kern_init
 **涉及文件：**
 
 - `code/kern/mm/pmm.c`
-- `code/kern/mm/default_pmm.c`
+- `code/kern/mm/best_fit_pmm.c`
 
 #### 4.1.1 功能说明
 
@@ -699,10 +699,10 @@ Schedule 相关检查通过，`make grade` 最终结果 30/30（截图见 5.3 �
 
 **负责人：**2411822-刘国全
 
-Lab4 的 `default_pmm.c` 需要提供 Best-Fit 管理器和 `best_fit_check()` 所需的空闲链表状态。由于 Lab4 骨架缺少 `best_fit_pmm.h`，且 `pmm.c` 固定引用 `default_pmm_manager`，最终把 Best-Fit 实现放在 `default_pmm.c` 中，并导出为：
+Lab4 的初始骨架只有 `default_pmm.c`，没有独立的 Best-Fit 实现文件，且 `pmm.c` 原先引用 `default_pmm_manager`。为避免把 Best-Fit 算法和默认文件混在一起，新增独立的 `best_fit_pmm.c` / `best_fit_pmm.h`，并将 `pmm.c` 切换到 `best_fit_pmm_manager`。Best-Fit 管理器仍复用骨架提供的 `best_fit_check()`：
 
 ```c
-const struct pmm_manager default_pmm_manager = {
+const struct pmm_manager best_fit_pmm_manager = {
     .name = "best_fit_pmm_manager",
     .init = best_fit_init,
     .init_memmap = best_fit_init_memmap,
@@ -942,11 +942,11 @@ int ensure_pte(pde_t *pgdir, uintptr_t la, pte_t **ptep);
 
 ### 7.3 AI 生成 Bug 与解决过程
 
-#### Bug 1：Lab4 骨架缺少 `best_fit_pmm.h`
+#### Bug 1：Best-Fit 实现与默认 PMM 文件混在一起
 
-- 现象：`default_pmm.c` 包含不存在的头文件。
-- 原因：Lab4 骨架改用了 `default_pmm_manager`，但测试仍叫 `best_fit_check`。
-- 解决：把 Best-Fit 函数直接实现到 `default_pmm.c`，删除不存在的头文件依赖，并导出 `default_pmm_manager`。
+- 现象：初始骨架只有 `default_pmm.c`，Best-Fit 管理器与默认文件职责混用。
+- 原因：骨架没有独立的 `best_fit_pmm.c` / `best_fit_pmm.h`，而 `pmm.c` 仍引用 `default_pmm_manager`。
+- 解决：新增独立的 `best_fit_pmm.c` / `best_fit_pmm.h`，在新的文件中导出 `best_fit_pmm_manager`，并把 `pmm.c` 的初始化切换到该管理器。
 
 #### Bug 2：调度器不回到链表头
 

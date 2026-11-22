@@ -27,14 +27,15 @@
 ```text
 [PROMPT]
 请检查 Lab4 的 kern/mm/default_pmm.c 和 kern/mm/pmm.c，将 Lab2 的 Best-Fit
-物理页管理器迁移到 Lab4。Lab4 骨架没有 best_fit_pmm.h，且 pmm.c 使用
-default_pmm_manager，因此不要把实现放到不存在的头文件中，应把 Best-Fit
-实现适配为 default_pmm_manager。同时补全 page_init()，根据 DTB 内存范围建立
-Page 描述符数组并把可用连续物理页交给 PMM。保留现有 local_intr_save/restore
-中断保护，不修改 basic_check()、best_fit_check()。
+物理页管理器迁移到 Lab4。Best-Fit 不应继续混在 default_pmm.c 中：请新建
+best_fit_pmm.c 和 best_fit_pmm.h，在其中实现 Best-Fit 管理器和
+best_fit_pmm_manager，并把 pmm.c 的初始化切换到 best_fit_pmm_manager。
+同时补全 page_init()，根据 DTB 内存范围建立 Page 描述符数组并把可用连续物理页
+交给 PMM。保留现有 local_intr_save/restore 中断保护，不修改 basic_check()、
+best_fit_check()。
 
 [RELY]
-- kern/mm/default_pmm.c、default_pmm.h、pmm.c、pmm.h
+- kern/mm/best_fit_pmm.c、best_fit_pmm.h、pmm.c、pmm.h
 - get_memory_base()、get_memory_size()
 - struct Page、free_area_t、list_*、PageReserved、PageProperty
 - DRAM_BASE、PGSIZE、PPN、PADDR、ROUNDUP、ROUNDDOWN
@@ -51,7 +52,7 @@ Page 描述符数组并把可用连续物理页交给 PMM。保留现有 local_i
 - best_fit_alloc_pages()
 - best_fit_free_pages()
 - best_fit_nr_free_pages()
-- const struct pmm_manager default_pmm_manager
+- const struct pmm_manager best_fit_pmm_manager
 - static void page_init(void)
 
 [SPECIFICATION]
@@ -77,8 +78,8 @@ alloc_pages 在 nr_free 不足时返回 NULL；
 
 ### 结果
 
-- 删除不存在的 `best_fit_pmm.h` 依赖。
-- Best-Fit 实现放入 `default_pmm.c`，并导出为 `default_pmm_manager`。
+- 新建 `best_fit_pmm.c` 和 `best_fit_pmm.h`。
+- `pmm.c` 改为引用 `best_fit_pmm_manager`。
 - `page_init()` 成功建立物理页描述符和空闲页链表。
 - `check_alloc_page()`、`check_pgdir()`、`check_boot_pgdir()` 均通过。
 

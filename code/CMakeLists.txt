@@ -43,6 +43,8 @@ add_executable(lab4
         kern/init/init.c
         kern/libs/readline.c
         kern/libs/stdio.c
+        kern/mm/best_fit_pmm.c
+        kern/mm/best_fit_pmm.h
         kern/mm/default_pmm.c
         kern/mm/default_pmm.h
         kern/mm/kmalloc.c
