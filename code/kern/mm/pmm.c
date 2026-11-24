@@ -87,7 +87,62 @@ size_t nr_free_pages(void)
     return ret;
 }
 
-//lab2 请补充你在lab2中的代码
+//lab2 function1 2411822
+static void
+page_init(void)
+{
+    extern char end[];
+
+    uint64_t mem_base = get_memory_base();
+    uint64_t mem_size = get_memory_size();
+    uint64_t mem_end = mem_base + mem_size;
+
+    if (mem_base < DRAM_BASE || mem_size == 0 || mem_end <= mem_base)
+    {
+        panic("page_init: invalid physical memory range [0x%016lx, 0x%016lx)",
+              mem_base, mem_end);
+    }
+
+    va_pa_offset = PHYSICAL_MEMORY_OFFSET;
+    npage = PPN(mem_end);
+    if (npage <= nbase)
+    {
+        panic("page_init: no manageable physical memory");
+    }
+
+    pages = (struct Page *)ROUNDUP((uintptr_t)end, PGSIZE);
+    size_t nr_pages = npage - nbase;
+    uintptr_t pages_end_va = (uintptr_t)pages + nr_pages * sizeof(struct Page);
+    uintptr_t pages_end_pa = PADDR(pages_end_va);
+
+    if (pages_end_pa > mem_end)
+    {
+        panic("page_init: Page descriptor array exceeds physical memory");
+    }
+
+    for (struct Page *p = pages; p < pages + nr_pages; p++)
+    {
+        p->flags = 0;
+        p->property = 0;
+        set_page_ref(p, 0);
+        SetPageReserved(p);
+    }
+
+    uintptr_t free_start_pa = ROUNDUP(pages_end_pa, PGSIZE);
+    uintptr_t free_end_pa = ROUNDDOWN(mem_end, PGSIZE);
+
+    cprintf("physical memory map:\n");
+    cprintf("memory: 0x%016lx, [0x%016lx, 0x%016lx].\n",
+            mem_size, mem_base, mem_end - 1);
+
+    if (free_start_pa < free_end_pa)
+    {
+        struct Page *base = pa2page(free_start_pa);
+        size_t free_pages = (free_end_pa - free_start_pa) / PGSIZE;
+        init_memmap(base, free_pages);
+    }
+}
+
 
 // boot_map_segment - setup&enable the paging mechanism
 // parameters
@@ -318,10 +373,98 @@ void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
 }
 
 
-//lab5 function3 YOUR CODE 
+//lab5 function3 2411822
+int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share)
+{
+    assert(start % PGSIZE == 0 && end % PGSIZE == 0);
+    assert(USER_ACCESS(start, end));
 
+    uintptr_t begin = start;
+    do
+    {
+        pte_t *ptep = get_pte(from, start, 0);
+        if (ptep == NULL)
+        {
+            start = ROUNDDOWN(start + PTSIZE, PTSIZE);
+            continue;
+        }
 
-//lab4 请补充你在lab4中的代码
+        if (*ptep & PTE_V)
+        {
+            struct Page *page = pte2page(*ptep);
+            uint32_t perm = *ptep & (PTE_U | PTE_R | PTE_W | PTE_X);
+
+            if (share)
+            {
+                if (page_insert(to, page, start, perm) != 0)
+                {
+                    goto failed;
+                }
+            }
+            else
+            {
+                struct Page *new_page = alloc_page();
+                if (new_page == NULL)
+                {
+                    goto failed;
+                }
+                memcpy(page2kva(new_page), page2kva(page), PGSIZE);
+                if (page_insert(to, new_page, start, perm) != 0)
+                {
+                    free_page(new_page);
+                    goto failed;
+                }
+            }
+        }
+        start += PGSIZE;
+    } while (start != 0 && start < end);
+
+    return 0;
+
+failed:
+    if (start > begin)
+    {
+        unmap_range(to, begin, start);
+    }
+    return -E_NO_MEM;
+}
+
+//lab4 function1 2411822
+int page_insert(pde_t *pgdir, struct Page *page, uintptr_t la, uint32_t perm)
+{
+    pte_t *ptep = get_pte(pgdir, la, 1);
+    if (ptep == NULL)
+    {
+        return -E_NO_MEM;
+    }
+
+    page_ref_inc(page);
+    if (*ptep & PTE_V)
+    {
+        struct Page *old_page = pte2page(*ptep);
+        if (old_page == page)
+        {
+            page_ref_dec(page);
+        }
+        else
+        {
+            page_remove_pte(pgdir, la, ptep);
+        }
+    }
+
+    *ptep = pte_create(page2ppn(page), perm);
+    tlb_invalidate(pgdir, la);
+    return 0;
+}
+
+void page_remove(pde_t *pgdir, uintptr_t la)
+{
+    pte_t *ptep = get_pte(pgdir, la, 0);
+    if (ptep != NULL)
+    {
+        page_remove_pte(pgdir, la, ptep);
+    }
+}
 
 
 // invalidate a TLB entry, but only if the page tables being
